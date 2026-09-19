@@ -27,8 +27,10 @@ import {
   renderConversation,
   renderEventRow,
   renderSocialMaterials,
+  renderToolCallRow,
 } from "./conversation";
 import type { ArtifactDownloadState, ChromeSetupState, ComposerProps } from "./conversation";
+import { ingestTimelineEntities, toolEventKey } from "./timeline";
 import { artifactPreviewMime, renderArtifactPreview } from "./artifact_preview";
 import type { ArtifactPreviewPaneState } from "./artifact_preview";
 import { bindNoteInteractions, setNoteRegistry } from "./notes";
@@ -1858,8 +1860,10 @@ export namespace agentPanel {
   // boundaries ("queued"/"started") never reach here — appendTaskEvent asks
   // for a full render that rebuilds the turn structure. The row lands in the
   // last turn's activity fold (skipped when the user folded it — the next
-  // full render/toggle rebuilds from state); a result's notes land in the
-  // always-visible notes container beneath the fold.
+  // full render/toggle rebuilds from state). A tool result replaces its
+  // call's placeholder row in place — the same grouping a full render's
+  // buildActivityItems produces — and its notes land in the always-visible
+  // materials strip beneath the fold.
   function appendEventRowIfSelected(payload: AgentTaskEventPayload): void {
     if (payload.task_id !== selectedTaskId) return;
     const stream = document.querySelector<HTMLDivElement>(`[data-agent-events="${payload.task_id}"]`);
@@ -1879,13 +1883,39 @@ export namespace agentPanel {
           return;
         }
       }
+      if (payload.kind === "tool_result" || payload.kind === "tool_error") {
+        // Ingest before rendering so the row's cards resolve against the
+        // registry in this same pass.
+        ingestTimelineEntities([payload]);
+        const key = toolEventKey(payload);
+        const task = tasks.find((item) => item.task_id === payload.task_id);
+        const call = task?.events.find(
+          (event) => event.kind === "tool_call" && toolEventKey(event) === key,
+        );
+        const html = renderToolCallRow(call, payload);
+        const placeholder = [...activity.querySelectorAll<HTMLElement>("[data-tool-call]")]
+          .find((row) => row.dataset.toolCall === key);
+        if (placeholder) {
+          placeholder.outerHTML = html;
+        } else {
+          const working = activity.querySelector(".act-row--working");
+          if (working) working.insertAdjacentHTML("beforebegin", html);
+          else activity.insertAdjacentHTML("beforeend", html);
+        }
+        if (pinned) stream.scrollTop = stream.scrollHeight;
+        if (task) updateLiveStrip(task);
+        return;
+      }
       const working = activity.querySelector(".act-row--working");
       if (working) working.insertAdjacentHTML("beforebegin", renderEventRow(payload));
       else activity.insertAdjacentHTML("beforeend", renderEventRow(payload));
     }
 
     if (pinned) stream.scrollTop = stream.scrollHeight;
-    if (payload.kind === "tool_result") {
+    if (payload.kind === "tool_result" || payload.kind === "tool_error") {
+      // The fold was closed — no row to patch, but the materials strip and
+      // the note registry still track the result.
+      ingestTimelineEntities([payload]);
       const task = tasks.find((item) => item.task_id === payload.task_id);
       if (task) updateLiveStrip(task);
     }

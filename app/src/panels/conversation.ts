@@ -16,7 +16,7 @@
 //!
 //! Rendering only; state and bindings live in tasks.ts.
 
-import type { AgentArtifact, AgentTaskEventPayload, AgentTaskSnapshot, NoteData, Status } from "../main";
+import type { AgentArtifact, AgentTaskEventPayload, AgentTaskSnapshot, Status } from "../main";
 import { esc } from "../lib/html";
 import {
   formatStepCount,
@@ -34,7 +34,8 @@ import type { ComposerVoiceState } from "../lib/voice-input";
 import feishuLogo from "../assets/connectors/feishu.png";
 import chromeRemoteDebuggingImage from "../assets/chrome-remote-debugging.png";
 import chromeAllowDialogImage from "../assets/chrome-allow-dialog.png";
-import { mergeNoteRegistry, noteDataForRef, renderNoteAnswer, renderNoteCards } from "./notes";
+import { noteDataForRef, renderNoteAnswer, renderNoteCards } from "./notes";
+import { ingestTimelineEntities, isQuietTool, renderToolEntities, toolEventKey } from "./timeline";
 import { artifactFileIcon, downloadIcon, eyeIcon, formatArtifactSize } from "./artifact_preview";
 import type { AgentTaskView } from "./tasks";
 
@@ -562,7 +563,7 @@ function renderActivity(
         <span class="activity-toggle__label">${esc(showWorking ? t("task.working") : t("task.activityLabel"))}</span>
         ${meta}
       </button>
-      ${open ? `<div class="activity activity--transcript">${body.map(renderEventRow).join("")}${workingRow}</div>` : ""}
+      ${open ? `<div class="activity activity--transcript">${renderActivityBody(body)}${workingRow}</div>` : ""}
     </div>
   `;
 }
@@ -570,6 +571,8 @@ function renderActivity(
 /** One activity row. Shared with the live event appender in tasks.ts so a
  *  streamed row lands as the same markup a full render rebuilds. */
 export function renderEventRow(ev: AgentTaskEventPayload): string {
+  if (ev.kind === "tool_call") return renderToolCallRow(ev, undefined);
+  if (ev.kind === "tool_result" || ev.kind === "tool_error") return renderToolCallRow(undefined, ev);
   const progressKey = ev.kind === "tool_progress" ? `${ev.id ?? ""}:${ev.phase ?? ""}` : "";
   const progressAttr = progressKey ? ` data-tool-progress="${esc(progressKey)}"` : "";
   if (ev.kind === "api_error") return renderTaskApiErrorEvent(ev);
@@ -577,6 +580,101 @@ export function renderEventRow(ev: AgentTaskEventPayload): string {
     ? toolProgressText(ev)
     : formatTaskInterruptionMessage(ev.text);
   return `<div class="act-row act-row--${esc(ev.kind)}"${progressAttr}><span class="act-row__glyph" aria-hidden="true">${eventGlyph(ev.kind)}</span><span class="act-row__text">${esc(text)}</span></div>`;
+}
+
+// A short, human hint from a tool's args: the query / note / author it
+// targets, never the full JSON payload.
+function toolArgsHint(args: unknown): string {
+  if (args === null || typeof args !== "object" || Array.isArray(args)) return "";
+  const record = args as Record<string, unknown>;
+  for (const key of ["query", "note_id", "author_id", "url", "keyword"]) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) {
+      const text = value.trim();
+      return text.length > 60 ? `${text.slice(0, 60)}…` : text;
+    }
+  }
+  return "";
+}
+
+// The parenthesized "3.2s · ~1.2k tokens" tail the shell stamps on result
+// text — shown as the row's quiet meta once the call finishes.
+function toolResultMeta(result: AgentTaskEventPayload): string {
+  if (result.kind === "tool_error" || result.ok === false) {
+    return (result.error ?? "").trim() || result.text.trim();
+  }
+  const paren = result.text.match(/\(([^()]*)\)/);
+  return paren ? paren[1] : "";
+}
+
+/** One tool invocation row: the placeholder a fresh call renders, updated in
+ *  place once its result lands (done / failed / rich entity content). The
+ *  `data-tool-call` key lets the live appender find this exact row — calls
+ *  of the same tool never overwrite each other. */
+export function renderToolCallRow(
+  call: AgentTaskEventPayload | undefined,
+  result: AgentTaskEventPayload | undefined,
+): string {
+  const source = call ?? result;
+  if (!source) return "";
+  const name = source.name ?? "tool";
+  const label = (source.label ?? "").trim() || name.replace(/_/g, " ");
+  const repeatCount = call?.repeat_count ?? 0;
+  const repeat = repeatCount > 1 ? ` ×${repeatCount}` : "";
+  const quiet = isQuietTool(name);
+  const failed = !!result && (result.kind === "tool_error" || result.ok === false);
+  const state = !result ? "pending" : failed ? "error" : "done";
+  const key = toolEventKey(source);
+  const hint = quiet ? "" : toolArgsHint(call?.args ?? result?.args);
+  let status = `<span class="act-tool__status"><i class="badge-dot badge-dot-ink badge-dot-pulse" aria-hidden="true"></i></span>`;
+  if (result) {
+    const meta = toolResultMeta(result);
+    const text = meta ? ` ${esc(meta)}` : "";
+    status = failed
+      ? `<span class="act-tool__status act-tool__status--error">✗${text}</span>`
+      : `<span class="act-tool__status">✓${text}</span>`;
+  }
+  const rich = result && !failed && !quiet ? renderToolEntities(result) : "";
+  return `<div class="act-row act-row--tool act-row--tool-${state}${quiet ? " act-row--quiet" : ""}" data-tool-call="${esc(key)}"><span class="act-row__glyph" aria-hidden="true">→</span><span class="act-row__text"><span class="act-tool__line"><span class="act-tool__label">${esc(label)}${repeat}</span>${hint ? `<span class="act-tool__hint">${esc(hint)}</span>` : ""}${status}</span>${rich}</span></div>`;
+}
+
+// Activity items pair a tool call with its result: the result updates the
+// call's row in place instead of appending a second line, so a streamed run
+// and a replayed history group identically. Results whose call row is
+// missing (truncated histories) still render, as standalone rows.
+type ActivityItem =
+  | { kind: "event"; event: AgentTaskEventPayload }
+  | { kind: "tool"; call?: AgentTaskEventPayload; result?: AgentTaskEventPayload };
+
+function buildActivityItems(body: AgentTaskEventPayload[]): ActivityItem[] {
+  const items: ActivityItem[] = [];
+  const pendingCalls = new Map<string, number>();
+  for (const event of body) {
+    if (event.kind === "tool_call") {
+      pendingCalls.set(toolEventKey(event), items.length);
+      items.push({ kind: "tool", call: event });
+      continue;
+    }
+    if (event.kind === "tool_result" || event.kind === "tool_error") {
+      const index = pendingCalls.get(toolEventKey(event));
+      if (index !== undefined) {
+        const item = items[index] as { kind: "tool"; call?: AgentTaskEventPayload; result?: AgentTaskEventPayload };
+        item.result = event;
+        pendingCalls.delete(toolEventKey(event));
+        continue;
+      }
+      items.push({ kind: "tool", result: event });
+      continue;
+    }
+    items.push({ kind: "event", event });
+  }
+  return items;
+}
+
+function renderActivityBody(body: AgentTaskEventPayload[]): string {
+  return buildActivityItems(body)
+    .map((item) => (item.kind === "tool" ? renderToolCallRow(item.call, item.result) : renderEventRow(item.event)))
+    .join("");
 }
 
 function renderTaskApiErrorEvent(ev: AgentTaskEventPayload): string {
@@ -642,6 +740,14 @@ export function noteRefsFromEvent(ev: AgentTaskEventPayload): string[] {
   };
   const asArray = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
   for (const entity of ev.entities ?? []) {
+    // Card grids and image/comment arrays carry their items directly.
+    if (Array.isArray(entity?.data)) {
+      for (const item of entity.data) {
+        const obj = item as { note_id?: unknown; entity?: { note_id?: unknown } };
+        push(obj?.entity?.note_id ?? obj?.note_id);
+      }
+      continue;
+    }
     const data = (entity?.data ?? {}) as Record<string, unknown>;
     if (entity?.type === "note") {
       push(typeof data.ref === "string" ? data.ref : (data as { note_id?: unknown }).note_id);
@@ -659,17 +765,7 @@ export function noteRefsFromEvent(ev: AgentTaskEventPayload): string[] {
 }
 
 function ingestNotesFromEvents(events: AgentTaskEventPayload[]): void {
-  const notes: NoteData[] = [];
-  for (const event of events) {
-    for (const entity of event.entities ?? []) {
-      const data = (entity?.data ?? {}) as Record<string, unknown>;
-      for (const item of Array.isArray(data.notes) ? data.notes : []) {
-        const note = item as NoteData;
-        if (typeof note?.note_id === "string" && typeof note?.site === "string") notes.push(note);
-      }
-    }
-  }
-  if (notes.length) mergeNoteRegistry(notes);
+  ingestTimelineEntities(events);
 }
 
 /** One conversation-level material library, independent from run/turn layout. */
@@ -681,7 +777,7 @@ export function renderSocialMaterials(task: AgentTaskView): string {
   };
   for (const note of task.notes ?? []) add(note.note_id);
   for (const event of task.events) {
-    if (event.kind === "tool_result") noteRefsFromEvent(event).forEach(add);
+    if (event.kind === "tool_result" || event.kind === "tool_error") noteRefsFromEvent(event).forEach(add);
   }
   if (!refs.length) return `<section class="social-materials" data-social-materials hidden></section>`;
 

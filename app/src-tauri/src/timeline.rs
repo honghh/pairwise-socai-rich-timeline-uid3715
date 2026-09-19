@@ -647,10 +647,19 @@ fn replay_run_events(snapshot: &AgentTaskSnapshot, run_dir: &Path) -> Vec<AgentT
         for (index, call) in calls.iter().enumerate() {
             let sequence = index as u32 + 1;
             let name = call.get("name").and_then(Value::as_str).unwrap_or("tool");
+            // Runs recorded without provider call ids (or with blank ones)
+            // still need a stable call↔result correlation key: derive it from
+            // the run, the step, the in-step sequence and the tool name — all
+            // recorded data — so every reload pairs the same call with the
+            // same result in the same order, and same-tool parallel or
+            // consecutive calls stay distinct.
             let id = call
                 .get("id")
                 .and_then(Value::as_str)
-                .unwrap_or("tool-call");
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("replay:{run_id}:s{step}:c{sequence}:{name}"));
             // Pre-rename runs (< #190) recorded tool dirs as `turn-…`.
             let tool_rel = ["step", "turn"]
                 .iter()
@@ -675,7 +684,7 @@ fn replay_run_events(snapshot: &AgentTaskSnapshot, run_dir: &Path) -> Vec<AgentT
                 .unwrap_or(&Value::Null);
             events.push(replay_event(
                 snapshot,
-                tool_call_event(id, step, sequence, name, input, 0),
+                tool_call_event(&id, step, sequence, name, input, 0),
             ));
             let output = read_json(&tool_dir.join("output.json")).unwrap_or(Value::Null);
             let error = manifest.get("error").and_then(Value::as_str);
@@ -687,7 +696,7 @@ fn replay_run_events(snapshot: &AgentTaskSnapshot, run_dir: &Path) -> Vec<AgentT
             events.push(replay_event(
                 snapshot,
                 tool_result_event(
-                    id,
+                    &id,
                     step,
                     sequence,
                     name,

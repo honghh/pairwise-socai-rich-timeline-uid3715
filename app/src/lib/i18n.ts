@@ -506,6 +506,13 @@ const messages = {
   "task.materialVideo": { en: "video", zh: "视频" },
   "task.materialImage": { en: "image post", zh: "图文" },
   "task.materialText": { en: "text post", zh: "文字" },
+  "task.commentsLabel": { en: "comments", zh: "评论" },
+  "task.moreItems": { en: "+{n} more", zh: "还有 {n} 条" },
+  "task.rawData": { en: "raw data", zh: "原始数据" },
+  "task.profileStats": {
+    en: "{followers} followers · {following} following · {likes} likes & collects",
+    zh: "粉丝 {followers} · 关注 {following} · 获赞与收藏 {likes}",
+  },
   "note.commentsHead": { en: "{n} comments", zh: "共 {n} 条评论" },
   "note.authorBadge": { en: "author", zh: "作者" },
   "note.transcript": { en: "transcript", zh: "语音转写" },
