@@ -27,6 +27,8 @@ import {
   renderConversation,
   renderEventRow,
   renderSocialMaterials,
+  renderToolActivityItem,
+  toolEventKey,
 } from "./conversation";
 import type { ArtifactDownloadState, ChromeSetupState, ComposerProps } from "./conversation";
 import { artifactPreviewMime, renderArtifactPreview } from "./artifact_preview";
@@ -1879,9 +1881,13 @@ export namespace agentPanel {
           return;
         }
       }
-      const working = activity.querySelector(".act-row--working");
-      if (working) working.insertAdjacentHTML("beforebegin", renderEventRow(payload));
-      else activity.insertAdjacentHTML("beforeend", renderEventRow(payload));
+      if (payload.kind === "tool_call" || payload.kind === "tool_result" || payload.kind === "tool_error") {
+        patchToolActivityRow(activity, payload);
+      } else {
+        const working = activity.querySelector(".act-row--working");
+        if (working) working.insertAdjacentHTML("beforebegin", renderEventRow(payload));
+        else activity.insertAdjacentHTML("beforeend", renderEventRow(payload));
+      }
     }
 
     if (pinned) stream.scrollTop = stream.scrollHeight;
@@ -1889,5 +1895,56 @@ export namespace agentPanel {
       const task = tasks.find((item) => item.task_id === payload.task_id);
       if (task) updateLiveStrip(task);
     }
+  }
+
+  // Patch one tool row in the live activity fold: a call inserts its pending
+  // placeholder, the matching result/error rewrites that same row in place.
+  // Pairing uses the same key + FIFO matching as the full-render grouping, so
+  // a live stream and a later reload produce identical rows.
+  function patchToolActivityRow(activity: HTMLDivElement, payload: AgentTaskEventPayload): void {
+    const key = toolEventKey(payload);
+    let call: AgentTaskEventPayload | null = null;
+    let result: AgentTaskEventPayload | null = null;
+    if (payload.kind === "tool_call") {
+      call = payload;
+    } else {
+      result = payload;
+      const task = tasks.find((item) => item.task_id === payload.task_id);
+      call = task ? matchToolCall(task.events, payload) : null;
+    }
+    const html = renderToolActivityItem(call, result);
+    const existing = [...activity.querySelectorAll<HTMLElement>("[data-tool-key]")]
+      .find((row) => row.dataset.toolKey === key);
+    if (existing) {
+      existing.outerHTML = html;
+      return;
+    }
+    const working = activity.querySelector(".act-row--working");
+    if (working) working.insertAdjacentHTML("beforebegin", html);
+    else activity.insertAdjacentHTML("beforeend", html);
+  }
+
+  // The call a result pairs with: the earliest still-unmatched call carrying
+  // the same key — the same queue the full-render grouping drains.
+  function matchToolCall(
+    events: AgentTaskEventPayload[],
+    result: AgentTaskEventPayload,
+  ): AgentTaskEventPayload | null {
+    const waiting = new Map<string, AgentTaskEventPayload[]>();
+    for (const event of events) {
+      if (event.kind === "tool_call") {
+        const key = toolEventKey(event);
+        const queue = waiting.get(key) ?? [];
+        queue.push(event);
+        waiting.set(key, queue);
+        continue;
+      }
+      if (event.kind === "tool_result" || event.kind === "tool_error") {
+        const queue = waiting.get(toolEventKey(event));
+        const call = queue?.shift() ?? null;
+        if (event === result) return call;
+      }
+    }
+    return null;
   }
 }

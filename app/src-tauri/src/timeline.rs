@@ -647,10 +647,6 @@ fn replay_run_events(snapshot: &AgentTaskSnapshot, run_dir: &Path) -> Vec<AgentT
         for (index, call) in calls.iter().enumerate() {
             let sequence = index as u32 + 1;
             let name = call.get("name").and_then(Value::as_str).unwrap_or("tool");
-            let id = call
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or("tool-call");
             // Pre-rename runs (< #190) recorded tool dirs as `turn-…`.
             let tool_rel = ["step", "turn"]
                 .iter()
@@ -667,6 +663,23 @@ fn replay_run_events(snapshot: &AgentTaskSnapshot, run_dir: &Path) -> Vec<AgentT
                         safe_component(name, "tool")
                     )
                 });
+            // Runs recorded before tool-call ids: derive a stable correlation
+            // id from the run + step + in-step sequence + tool name (the tool
+            // dir name carries exactly those), so a replayed call/result pair
+            // matches the same way on every reload — and parallel or repeated
+            // calls to one tool never collapse into each other.
+            let id = call
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    if run_id.is_empty() {
+                        tool_rel.clone()
+                    } else {
+                        format!("{run_id}:{tool_rel}")
+                    }
+                });
             let tool_dir = run_dir.join(&tool_rel);
             let manifest = read_json(&tool_dir.join("tool.json")).unwrap_or(Value::Null);
             let input = manifest
@@ -675,7 +688,7 @@ fn replay_run_events(snapshot: &AgentTaskSnapshot, run_dir: &Path) -> Vec<AgentT
                 .unwrap_or(&Value::Null);
             events.push(replay_event(
                 snapshot,
-                tool_call_event(id, step, sequence, name, input, 0),
+                tool_call_event(&id, step, sequence, name, input, 0),
             ));
             let output = read_json(&tool_dir.join("output.json")).unwrap_or(Value::Null);
             let error = manifest.get("error").and_then(Value::as_str);
@@ -687,7 +700,7 @@ fn replay_run_events(snapshot: &AgentTaskSnapshot, run_dir: &Path) -> Vec<AgentT
             events.push(replay_event(
                 snapshot,
                 tool_result_event(
-                    id,
+                    &id,
                     step,
                     sequence,
                     name,

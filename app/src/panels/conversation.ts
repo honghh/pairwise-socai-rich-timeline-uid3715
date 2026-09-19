@@ -16,7 +16,7 @@
 //!
 //! Rendering only; state and bindings live in tasks.ts.
 
-import type { AgentArtifact, AgentTaskEventPayload, AgentTaskSnapshot, NoteData, Status } from "../main";
+import type { AgentArtifact, AgentTaskEventPayload, AgentTaskSnapshot, NoteComment, NoteData, NoteMedia, Status, TimelineEntity } from "../main";
 import { esc } from "../lib/html";
 import {
   formatStepCount,
@@ -34,7 +34,7 @@ import type { ComposerVoiceState } from "../lib/voice-input";
 import feishuLogo from "../assets/connectors/feishu.png";
 import chromeRemoteDebuggingImage from "../assets/chrome-remote-debugging.png";
 import chromeAllowDialogImage from "../assets/chrome-allow-dialog.png";
-import { mergeNoteRegistry, noteDataForRef, renderNoteAnswer, renderNoteCards } from "./notes";
+import { mergeNoteRegistry, noteDataForRef, renderCommentList, renderImageStrip, renderNoteAnswer, renderNoteCards } from "./notes";
 import { artifactFileIcon, downloadIcon, eyeIcon, formatArtifactSize } from "./artifact_preview";
 import type { AgentTaskView } from "./tasks";
 
@@ -562,7 +562,7 @@ function renderActivity(
         <span class="activity-toggle__label">${esc(showWorking ? t("task.working") : t("task.activityLabel"))}</span>
         ${meta}
       </button>
-      ${open ? `<div class="activity activity--transcript">${body.map(renderEventRow).join("")}${workingRow}</div>` : ""}
+      ${open ? `<div class="activity activity--transcript">${renderActivityBody(body)}${workingRow}</div>` : ""}
     </div>
   `;
 }
@@ -589,6 +589,419 @@ function renderTaskApiErrorEvent(ev: AgentTaskEventPayload): string {
       <span class="task-api-error-copy__meta">${esc(presentation.meta)}</span>
     </span>
   </div>`;
+}
+
+// ── tool calls ↔ results: one row per invocation ─────────────────────
+// A tool call lands as a pending placeholder the moment it starts; its
+// result (or error) rewrites that same row — rich entities inline for
+// content-bearing tools, a one-line label for light ones. Pairing rides on
+// the call id; records from before ids existed fall back to a stable
+// step/sequence/name key so replayed history pairs up identically on every
+// reload, and repeated or parallel calls to one tool stay independent rows.
+export function toolEventKey(ev: AgentTaskEventPayload): string {
+  const id = ev.id?.trim();
+  if (id) return `id:${id}`;
+  return `legacy:${ev.step ?? 0}:${ev.sequence_in_step ?? 0}:${ev.name ?? "tool"}`;
+}
+
+interface ToolActivityItem {
+  call: AgentTaskEventPayload | null;
+  result: AgentTaskEventPayload | null;
+}
+
+type ActivityItem =
+  | { type: "event"; event: AgentTaskEventPayload }
+  | { type: "tool"; tool: ToolActivityItem };
+
+function groupActivityItems(body: AgentTaskEventPayload[]): ActivityItem[] {
+  const items: ActivityItem[] = [];
+  const waiting = new Map<string, ToolActivityItem[]>();
+  for (const event of body) {
+    if (event.kind === "tool_call") {
+      const tool: ToolActivityItem = { call: event, result: null };
+      items.push({ type: "tool", tool });
+      const key = toolEventKey(event);
+      const queue = waiting.get(key) ?? [];
+      queue.push(tool);
+      waiting.set(key, queue);
+      continue;
+    }
+    if (event.kind === "tool_result" || event.kind === "tool_error") {
+      const queue = waiting.get(toolEventKey(event));
+      const tool = queue?.shift();
+      if (tool) {
+        tool.result = event;
+      } else {
+        // A result whose call row was never recorded still renders, alone.
+        items.push({ type: "tool", tool: { call: null, result: event } });
+      }
+      continue;
+    }
+    items.push({ type: "event", event });
+  }
+  return items;
+}
+
+function renderActivityBody(body: AgentTaskEventPayload[]): string {
+  return groupActivityItems(body)
+    .map((item) => (item.type === "tool" ? renderToolActivityItem(item.tool.call, item.tool.result) : renderEventRow(item.event)))
+    .join("");
+}
+
+// Internal page plumbing stays a whisper next to content-bearing tools.
+const QUIET_TOOLS = new Set([
+  "page_state",
+  "scroll_in_note",
+  "open_note",
+  "close_note",
+  "list_search_tabs",
+  "click_search_tab",
+  "wait_for_rate_limit",
+]);
+
+/** One tool invocation row: pending placeholder, finished label, or rich
+ *  result. Shared by the full-render path and the live stream patcher so
+ *  both produce identical markup for the same events. */
+export function renderToolActivityItem(
+  call: AgentTaskEventPayload | null,
+  result: AgentTaskEventPayload | null,
+): string {
+  const anchor = result ?? call;
+  if (!anchor) return "";
+  const name = anchor.name ?? "tool";
+  const label = anchor.label ?? name.replace(/_/g, " ");
+  const failed = !!result && (result.kind === "tool_error" || result.ok === false);
+  const state = !result ? "pending" : failed ? "error" : "done";
+  const quiet = QUIET_TOOLS.has(name);
+  const glyph = state === "pending" ? "→" : failed ? "✗" : "✓";
+  const argsSummary = quiet ? "" : toolArgsSummary(call ?? result);
+  const stateText = state === "pending"
+    ? t("task.toolRunning")
+    : result?.duration_ms != null
+      ? formatDurationMs(result.duration_ms)
+      : "";
+  const errorText = failed && result?.error
+    ? `<div class="act-tool__error">${esc(result.error)}</div>`
+    : "";
+  const entities = state === "pending" ? [] : (result?.entities ?? []);
+  const rich = entities.length
+    ? `<div class="act-tool__entities">${entities.map(renderTimelineEntity).join("")}</div>`
+    : "";
+  return `
+    <div class="act-tool act-tool--${state}${quiet ? " act-tool--quiet" : ""}" data-tool-key="${esc(toolEventKey(anchor))}">
+      <div class="act-tool__head">
+        <span class="act-row__glyph" aria-hidden="true">${glyph}</span>
+        <span class="act-tool__label">${esc(label)}${argsSummary ? `<span class="act-tool__args">${esc(argsSummary)}</span>` : ""}</span>
+        <span class="act-tool__state">${esc(stateText)}</span>
+      </div>
+      ${errorText}
+      ${rich}
+    </div>`;
+}
+
+// A short human hint from the call args (the search query, a note id…).
+function toolArgsSummary(ev: AgentTaskEventPayload | null): string {
+  const args = ev?.args;
+  if (!args || typeof args !== "object") return "";
+  const record = args as Record<string, unknown>;
+  const candidate = record.query ?? record.note_id ?? record.author_id ?? record.url ?? record.tool_name;
+  if (typeof candidate !== "string" || !candidate.trim()) return "";
+  const trimmed = candidate.trim();
+  return trimmed.length > 60 ? `${trimmed.slice(0, 60)}…` : trimmed;
+}
+
+// ── tool-result entities → rich inline content ───────────────────────
+// Every renderer degrades: unknown types, malformed payloads, and empty
+// extractions fall back to an expandable JSON block so one bad entity can
+// never take the whole timeline down with it.
+function renderTimelineEntity(entity: TimelineEntity): string {
+  try {
+    const html = renderTimelineEntityInner(entity);
+    if (html) return html;
+  } catch (error) {
+    console.error("timeline entity render failed:", error);
+  }
+  return renderEntityJsonFallback(entity);
+}
+
+function renderTimelineEntityInner(entity: TimelineEntity): string {
+  const data = entity?.data;
+  switch (entity?.type) {
+    case "xhs_note_card_grid":
+      return renderEntityCardGrid(asArray(data).map(noteFromCard));
+    case "xhs_note": {
+      const note = noteFromEntity(data);
+      return note ? renderEntityNotes([note], "rich") : "";
+    }
+    case "xhs_search":
+    case "social_post_grid":
+      return renderEntityCardGrid(notesFromBundle(data));
+    case "xhs_author_profile":
+      return renderAuthorProfileEntity(data);
+    case "xhs_comments":
+      return renderCommentsEntity(asArray(data));
+    case "xhs_image_strip":
+      return renderImageStrip(
+        asArray(data)
+          .map((item) => (typeof item === "string" ? item : stringField(asRecord(item), "src") ?? stringField(asRecord(item), "url") ?? ""))
+          .filter(Boolean),
+      );
+    default:
+      return "";
+  }
+}
+
+function renderEntityJsonFallback(entity: TimelineEntity): string {
+  let json = "";
+  try {
+    json = JSON.stringify(entity?.data ?? null, null, 2) ?? "";
+  } catch {
+    json = String(entity?.data ?? "");
+  }
+  if (json.length > 6000) json = `${json.slice(0, 6000)}\n…`;
+  const label = typeof entity?.type === "string" && entity.type ? entity.type.replace(/_/g, " ") : "data";
+  return `
+    <details class="act-entity-json">
+      <summary>${esc(label)}</summary>
+      <pre>${esc(json)}</pre>
+    </details>`;
+}
+
+function renderEntityCardGrid(notes: (NoteData | null)[]): string {
+  return renderEntityNotes(notes.filter((note): note is NoteData => !!note), "compact");
+}
+
+function renderEntityNotes(notes: NoteData[], density: "rich" | "compact"): string {
+  if (!notes.length) return "";
+  mergeNoteRegistry(notes);
+  const refs = notes.map((note) => note.note_id);
+  const cards = renderNoteCards(refs, density);
+  return cards ? `<div class="act-tool__cards">${cards}</div>` : "";
+}
+
+function renderCommentsEntity(items: unknown[]): string {
+  const comments = items.map(commentFromValue).filter((comment): comment is NoteComment => !!comment);
+  if (!comments.length) return "";
+  return `<div class="act-entity act-entity--comments">${renderCommentList(comments)}</div>`;
+}
+
+function renderAuthorProfileEntity(data: unknown): string {
+  const profile = asRecord(data);
+  if (!profile) return "";
+  const name = stringField(profile, "display_name") ?? stringField(profile, "title") ?? "";
+  const handle = stringField(profile, "xhs_id") ?? "";
+  const bio = stringField(profile, "bio") ?? "";
+  const ip = stringField(profile, "ip_location") ?? "";
+  const verification = stringField(profile, "verification") ?? "";
+  const url = stringField(profile, "url") ?? "";
+  const stats = (
+    [
+      [stringField(profile, "followers"), t("task.profileFollowers")],
+      [stringField(profile, "following"), t("task.profileFollowing")],
+      [stringField(profile, "likes_and_collections"), t("task.profileLikes")],
+    ] as [string | undefined, string][]
+  )
+    .filter((pair): pair is [string, string] => !!pair[0])
+    .map(([value, label]) => `<span class="act-profile__stat"><span class="act-profile__stat-value">${esc(value)}</span> ${esc(label)}</span>`)
+    .join("");
+  const cards = asArray(profile.note_cards).map(noteFromCard).filter((note): note is NoteData => !!note);
+  const cardRow = cards.length ? renderEntityNotes(cards, "compact") : "";
+  if (!name && !stats && !cardRow) return "";
+  const initial = esc(Array.from(name || "·")[0]);
+  const headAttrs = url ? ` data-note-external="${esc(url)}" role="button" tabindex="0" title="${esc(url)}"` : "";
+  return `
+    <div class="act-profile">
+      <div class="act-profile__head"${headAttrs}>
+        <span class="note-author__avatar act-profile__avatar" aria-hidden="true">${initial}</span>
+        <span class="act-profile__id">
+          <span class="act-profile__name">${esc(name)}${verification ? `<span class="act-profile__badge">${esc(verification)}</span>` : ""}</span>
+          ${handle ? `<span class="act-profile__handle">${esc(handle)}</span>` : ""}
+        </span>
+      </div>
+      ${bio ? `<p class="act-profile__bio">${esc(bio)}</p>` : ""}
+      ${stats || ip ? `<div class="act-profile__stats">${stats}${ip ? `<span class="act-profile__stat">${esc(ip)}</span>` : ""}</div>` : ""}
+      ${cardRow}
+    </div>`;
+}
+
+// ── entity payload → NoteData / NoteComment coercion ─────────────────
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+function asArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function stringField(record: Record<string, unknown> | null, key: string): string | undefined {
+  const value = record?.[key];
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+// "1.2万" / "3k" / "1,234" → number, mirroring the core's parse_count_text.
+function parseCountText(raw: unknown): number | undefined {
+  if (typeof raw === "number" && Number.isFinite(raw)) return Math.round(raw);
+  if (typeof raw !== "string") return undefined;
+  const text = raw.trim().toLowerCase().replace(/[,+]/g, "");
+  const match = /^(\d+(?:\.\d+)?)([kw万亿]?)$/.exec(text);
+  if (!match) return undefined;
+  const value = Number.parseFloat(match[1]);
+  if (!Number.isFinite(value)) return undefined;
+  const unit = match[2];
+  const scale = unit === "k" ? 1_000 : unit === "w" || unit === "万" ? 10_000 : unit === "亿" ? 100_000_000 : 1;
+  return Math.round(value * scale);
+}
+
+function authorFromFields(record: Record<string, unknown>): NoteData["author"] | undefined {
+  const author = asRecord(record.author);
+  if (author) {
+    const name = stringField(author, "name");
+    const url = stringField(author, "url");
+    const handle = stringField(author, "handle") ?? stringField(author, "id");
+    const avatar = stringField(author, "avatar");
+    if (name || url || handle || avatar) return { name, url, handle, avatar };
+    return undefined;
+  }
+  const name = stringField(record, "author");
+  const url = stringField(record, "author_url");
+  const handle = stringField(record, "author_id");
+  if (!name && !url && !handle) return undefined;
+  return { name, url, handle };
+}
+
+function mediaFromValue(value: unknown): NoteMedia | null {
+  if (typeof value === "string" && value.trim()) return { kind: "image", src: value.trim() };
+  const record = asRecord(value);
+  if (!record) return null;
+  const src = stringField(record, "src") ?? stringField(record, "url");
+  if (!src) return null;
+  return {
+    kind: record.kind === "video" ? "video" : "image",
+    src,
+    poster: stringField(record, "poster"),
+    dur: stringField(record, "dur") ?? stringField(record, "duration"),
+    ratio: stringField(record, "ratio"),
+  };
+}
+
+function statsFromFields(record: Record<string, unknown>): NoteData["stats"] | undefined {
+  const stats = asRecord(record.stats);
+  if (stats) {
+    const likes = parseCountText(stats.likes);
+    const collects = parseCountText(stats.collects);
+    const comments = parseCountText(stats.comments);
+    const shares = parseCountText(stats.shares);
+    if (likes !== undefined || collects !== undefined || comments !== undefined || shares !== undefined) {
+      return { likes, collects, comments, shares };
+    }
+    return undefined;
+  }
+  const likes = parseCountText(record.likes);
+  const collects = parseCountText(record.favorites);
+  const comments = parseCountText(record.comments_count);
+  return likes !== undefined || collects !== undefined || comments !== undefined
+    ? { likes, collects, comments }
+    : undefined;
+}
+
+/** A search-result card (XhsNoteCard wire shape) → registry note. */
+function noteFromCard(value: unknown): NoteData | null {
+  const card = asRecord(value);
+  const noteId = stringField(card, "note_id");
+  if (!card || !noteId) return null;
+  const cover = stringField(card, "cover_url") ?? stringField(card, "cover");
+  const media: NoteMedia[] = cover
+    ? [{ kind: stringField(card, "type") === "video" ? "video" : "image", src: cover }]
+    : [];
+  const likes = parseCountText(card.likes);
+  return {
+    note_id: noteId,
+    site: "xhs",
+    title: stringField(card, "title"),
+    url: stringField(card, "link") ?? stringField(card, "url"),
+    author: authorFromFields(card),
+    stats: likes !== undefined ? { likes } : undefined,
+    media,
+    level: "card",
+  };
+}
+
+/** A full note entity (XhsNote wire shape) → registry note. */
+function noteFromEntity(value: unknown): NoteData | null {
+  const entity = asRecord(value);
+  const noteId = stringField(entity, "note_id");
+  if (!entity || !noteId) return null;
+  const media: NoteMedia[] = [];
+  const video = asRecord(entity.video);
+  const videoSrc = stringField(video, "src") ?? stringField(video, "url");
+  if (videoSrc) {
+    media.push({
+      kind: "video",
+      src: videoSrc,
+      poster: stringField(video, "poster"),
+      dur: stringField(video, "dur") ?? stringField(video, "duration"),
+    });
+  }
+  // XHS wire entities carry `images`; archived NoteData records carry `media`.
+  const images = asArray(entity.images).length ? asArray(entity.images) : asArray(entity.media);
+  for (const image of images) {
+    const item = mediaFromValue(image);
+    if (item) media.push(item);
+  }
+  return {
+    note_id: noteId,
+    site: stringField(entity, "site") ?? "xhs",
+    title: stringField(entity, "title"),
+    content: stringField(entity, "content"),
+    url: stringField(entity, "url"),
+    author: authorFromFields(entity),
+    ip_location: stringField(entity, "ip_location"),
+    stats: statsFromFields(entity),
+    media,
+    level: "detail",
+  };
+}
+
+/** Aggregate bundles wrap each note as `{entity, …}` (or carry plain notes). */
+function notesFromBundle(data: unknown): NoteData[] {
+  const bundle = asRecord(data);
+  if (!bundle) return [];
+  const notes = asArray(bundle.notes)
+    .map((item) => {
+      const record = asRecord(item);
+      if (!record) return null;
+      const inner = asRecord(record.entity) ?? record;
+      // Archive records are already NoteData — keep them whole (media_dir,
+      // posted_at, transcript…). Wire entities and cards get coerced.
+      if (typeof inner.note_id === "string" && inner.note_id && (inner.media !== undefined || inner.site !== undefined)) {
+        return inner as unknown as NoteData;
+      }
+      return noteFromEntity(inner) ?? noteFromCard(inner);
+    })
+    .filter((note): note is NoteData => !!note);
+  if (notes.length) return notes;
+  const search = asRecord(bundle.search);
+  return asArray(search?.cards ?? bundle.cards).map(noteFromCard).filter((note): note is NoteData => !!note);
+}
+
+/** A comment extractor record (page_scripts `parseComment`) → NoteComment. */
+function commentFromValue(value: unknown): NoteComment | null {
+  const record = asRecord(value);
+  if (!record) return null;
+  const text = stringField(record, "text") ?? stringField(record, "content");
+  if (!text) return null;
+  const replies = asArray(record.sub_comments ?? record.replies)
+    .map(commentFromValue)
+    .filter((comment): comment is NoteComment => !!comment);
+  return {
+    comment_id: stringField(record, "comment_id"),
+    text,
+    author: stringField(record, "username") ?? stringField(record, "author"),
+    likes: parseCountText(record.like_count ?? record.likes),
+    time: stringField(record, "time"),
+    is_author: record.is_author === true || record.is_author_reply === true,
+    replies: replies.length ? replies : undefined,
+  };
 }
 
 function renderTaskApiErrorCard(error: string): string {
@@ -662,10 +1075,34 @@ function ingestNotesFromEvents(events: AgentTaskEventPayload[]): void {
   const notes: NoteData[] = [];
   for (const event of events) {
     for (const entity of event.entities ?? []) {
-      const data = (entity?.data ?? {}) as Record<string, unknown>;
-      for (const item of Array.isArray(data.notes) ? data.notes : []) {
-        const note = item as NoteData;
-        if (typeof note?.note_id === "string" && typeof note?.site === "string") notes.push(note);
+      switch (entity?.type) {
+        case "xhs_note_card_grid":
+          notes.push(...asArray(entity.data).map(noteFromCard).filter((note): note is NoteData => !!note));
+          break;
+        case "xhs_note": {
+          const note = noteFromEntity(entity.data);
+          if (note) notes.push(note);
+          break;
+        }
+        case "xhs_search":
+        case "social_post_grid":
+          notes.push(...notesFromBundle(entity.data));
+          break;
+        case "xhs_author_profile":
+          notes.push(
+            ...asArray(asRecord(entity.data)?.note_cards)
+              .map(noteFromCard)
+              .filter((note): note is NoteData => !!note),
+          );
+          break;
+        default: {
+          // Archive-shaped notes (already NoteData) pass through untouched.
+          const data = asRecord(entity?.data);
+          for (const item of asArray(data?.notes)) {
+            const note = item as NoteData;
+            if (typeof note?.note_id === "string" && typeof note?.site === "string") notes.push(note);
+          }
+        }
       }
     }
   }

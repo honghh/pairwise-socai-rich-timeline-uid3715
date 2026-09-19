@@ -511,6 +511,31 @@ function commentHTML(comment: NoteComment, isReply = false): string {
       </div>
     </div>`;
 }
+
+/** A standalone comment list for a tool-result entity (extract_comments). */
+export function renderCommentList(comments: NoteComment[]): string {
+  if (!comments.length) return "";
+  return `<div class="act-comments">${comments.map((comment) => commentHTML(comment)).join("")}</div>`;
+}
+
+/** Loose image strip for tool-result entities (e.g. collected carousel
+ *  images) that aren't tied to one archived note. Sources may be remote
+ *  URLs, absolute paths, or run-relative paths. */
+export function renderImageStrip(sources: string[]): string {
+  const frames = sources
+    .filter((src) => typeof src === "string" && src.trim())
+    .map((src) => {
+      const url = /^(asset|https?):/i.test(src)
+        ? src
+        : src.startsWith("/") || /^[a-zA-Z]:[\\/]/.test(src)
+          ? convertFileSrc(src)
+          : convertFileSrc(`${RUN_DIR.replace(/\/$/, "")}/${src}`);
+      return `<span class="act-strip__frame"><img class="act-strip__img" src="${esc(url)}" alt="" loading="lazy" /></span>`;
+    })
+    .join("");
+  return frames ? `<div class="act-strip">${frames}</div>` : "";
+}
+
 function viewPanel(note: NoteData): string {
   const name = esc((note.author && note.author.name) || "");
   const authorUrl = (note.author && note.author.url) || "";
