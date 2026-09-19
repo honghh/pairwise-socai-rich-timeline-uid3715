@@ -1,0 +1,320 @@
+use chrono::{Datelike, FixedOffset, NaiveDate, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
+
+/// XHS note — wire-ready. Field order, names, and types match the public JSON
+/// shape used by run artifacts and app timelines.
+///
+/// All normalization (strip URL fragment, clip hashtags to 12, image_count
+/// fallback to images.len()) is performed during parsing, so serializing
+/// directly with serde_json yields stable output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct XhsNote {
+    pub note_id: String,
+    pub url: String,
+    pub r#type: String,
+    pub title: String,
+    pub author: String,
+    pub author_id: String,
+    pub author_url: String,
+    pub content: String,
+    pub content_source: String,
+    pub hashtags: Vec<String>,
+    pub date: String,
+    /// True when the note's date bar showed "编辑于 …" — [`Self::date`] is
+    /// then the last-edited date, not the original publish date. Omitted from
+    /// the wire shape when false so older artifacts stay byte-identical.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub date_edited: bool,
+    /// Note POI / geo-tag label (the place the author tagged on the note).
+    /// Distinct from [`Self::ip_location`], the author's IP territory.
+    pub location: String,
+    /// Author IP territory shown on the note detail's date bar ("广东").
+    /// Empty when the page didn't expose one; omitted from the wire shape
+    /// in that case so older artifacts stay byte-identical.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ip_location: String,
+    pub likes: String,
+    pub favorites: String,
+    pub comments_count: String,
+    pub image_count: i64,
+    pub images: Vec<Value>,
+    pub video: Value,
+
+    /// Serialized as `"wait"` to keep the public note shape compact.
+    #[serde(rename = "wait", skip_serializing_if = "Option::is_none", default)]
+    pub wait_meta: Option<Value>,
+
+    /// Only present when consecutive extracts return the same note_id —
+    /// MVP doesn't implement the cross-call tracking, so this stays None.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub stale_warning: Option<String>,
+}
+
+/// Author profile entity. Wire shape includes the derived `_value` integer
+/// fields produced by [`parse_count_text`].
+#[derive(Debug, Clone, Default)]
+pub struct XhsAuthorProfile {
+    pub display_name: String,
+    pub xhs_id: String,
+    pub profile_url: String,
+    pub bio: String,
+    pub ip_location: String,
+    /// Official-verification (认证) badge on the profile header: `verified`
+    /// flags it, `verification` carries the label ("企业认证" / "个人认证").
+    /// Both stay off the wire for regular accounts.
+    pub verified: bool,
+    pub verification: String,
+    pub followers: String,
+    pub following: String,
+    pub likes_and_collections: String,
+    pub note_cards: Vec<XhsNoteCard>,
+}
+
+impl XhsAuthorProfile {
+    pub fn to_value(&self) -> Value {
+        let mut map = Map::new();
+        map.insert("entity_type".into(), json!("author"));
+        map.insert("display_name".into(), json!(self.display_name));
+        map.insert("title".into(), json!(self.display_name));
+        map.insert("xhs_id".into(), json!(self.xhs_id));
+        map.insert("url".into(), json!(normalize_url(&self.profile_url)));
+        map.insert("bio".into(), json!(self.bio));
+        map.insert("ip_location".into(), json!(self.ip_location));
+        // Official verification is the exception to always-emit: absent for
+        // regular accounts so existing author payloads keep their shape.
+        if self.verified {
+            map.insert("verified".into(), json!(true));
+        }
+        if !self.verification.is_empty() {
+            map.insert("verification".into(), json!(self.verification));
+        }
+        // Counts are kept as the raw displayed strings ("1.2万"); the parsed
+        // `*_value` integers were redundant, so they're no longer emitted.
+        map.insert("followers".into(), json!(self.followers));
+        map.insert("following".into(), json!(self.following));
+        map.insert(
+            "likes_and_collections".into(),
+            json!(self.likes_and_collections),
+        );
+        map.insert("note_count".into(), json!(self.note_cards.len()));
+        let cards: Vec<Value> = self
+            .note_cards
+            .iter()
+            .map(|c| serde_json::to_value(c).unwrap_or(Value::Null))
+            .collect();
+        map.insert("note_cards".into(), Value::Array(cards));
+        Value::Object(map)
+    }
+}
+
+/// Parse a Xiaohongshu count text like "1.2k", "3万", "1,234". Returns
+/// 0 on anything unparseable.
+pub fn parse_count_text(raw: &str) -> i64 {
+    let value: String = raw.trim().to_lowercase().replace([',', '+'], "");
+    if value.is_empty() {
+        return 0;
+    }
+    // Find leading numeric prefix (with optional decimal) + optional unit suffix.
+    let bytes = value.as_bytes();
+    let mut end = 0usize;
+    let mut saw_dot = false;
+    for (i, ch) in value.char_indices() {
+        if ch.is_ascii_digit() {
+            end = i + ch.len_utf8();
+            continue;
+        }
+        if ch == '.' && !saw_dot {
+            saw_dot = true;
+            end = i + ch.len_utf8();
+            continue;
+        }
+        break;
+    }
+    if end == 0 {
+        return 0;
+    }
+    let number: f64 = std::str::from_utf8(&bytes[..end])
+        .unwrap_or("0")
+        .parse()
+        .unwrap_or(0.0);
+    let unit: String = value[end..]
+        .chars()
+        .take(1)
+        .collect::<String>()
+        .to_lowercase();
+    let multiplier = match unit.as_str() {
+        "万" | "w" => 10_000.0,
+        "k" => 1_000.0,
+        _ => 1.0,
+    };
+    (number * multiplier).round() as i64
+}
+
+/// Parse a count display string into a stat value, distinguishing "no count
+/// shown" from zero: strings without any digit — empty, or the bare button
+/// labels ("收藏", "评论") XHS renders when a count is hidden — yield `None`
+/// rather than 0.
+pub fn parse_stat_count(raw: &str) -> Option<i64> {
+    let trimmed = raw.trim();
+    if !trimmed.chars().any(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(parse_count_text(trimmed))
+}
+
+/// Parse a note's normalized `date` string — "YYYY-M-D", or "M-D" with the
+/// current year implied (the page scripts resolve relative forms like 昨天 to
+/// this) — into epoch milliseconds. Returns `None` for empty strings,
+/// non-date text, and score-like junk that occasionally leaks into the field
+/// ("6-0"): real calendar validation via `NaiveDate` rejects impossible
+/// month/day pairs.
+///
+/// The instant is pinned at 20:00 Beijing = 12:00 UTC — noon-UTC anchoring
+/// makes viewer-local date formatting reproduce the Beijing calendar date for
+/// every timezone in UTC-12…UTC+11 (an 08:00 anchor would be midnight UTC and
+/// render one day early across the Americas).
+pub fn parse_posted_at_ms(raw: &str) -> Option<i64> {
+    let beijing = FixedOffset::east_opt(8 * 3600)?;
+    let stamp = |year: i32, month: u32, day: u32| -> Option<i64> {
+        if !(2000..=2100).contains(&year) {
+            return None;
+        }
+        NaiveDate::from_ymd_opt(year, month, day)?
+            .and_hms_opt(20, 0, 0)?
+            .and_local_timezone(beijing)
+            .single()
+            .map(|dt| dt.timestamp_millis())
+    };
+    let parts: Vec<&str> = raw.trim().split('-').collect();
+    match parts.as_slice() {
+        [y, m, d] => stamp(y.parse().ok()?, m.parse().ok()?, d.parse().ok()?),
+        [m, d] => {
+            let (month, day) = (m.parse().ok()?, d.parse().ok()?);
+            let now = Utc::now().with_timezone(&beijing);
+            let ms = stamp(now.year(), month, day)?;
+            // A yearless label can never be in the future: "12-31" read in
+            // early January belongs to the year that just ended.
+            if ms > now.timestamp_millis() + 24 * 3600 * 1000 {
+                stamp(now.year() - 1, month, day)
+            } else {
+                Some(ms)
+            }
+        }
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct XhsNoteCard {
+    pub note_id: String,
+    pub title: String,
+    pub author: String,
+    pub author_id: String,
+    pub author_url: String,
+    pub likes: String,
+    pub link: String,
+    pub cover_url: String,
+    pub r#type: String,
+    pub position: i64,
+    pub xsec_token: String,
+}
+
+impl Default for XhsNote {
+    fn default() -> Self {
+        Self {
+            note_id: String::new(),
+            url: String::new(),
+            r#type: String::new(),
+            title: String::new(),
+            author: String::new(),
+            author_id: String::new(),
+            author_url: String::new(),
+            content: String::new(),
+            content_source: String::new(),
+            hashtags: Vec::new(),
+            date: String::new(),
+            date_edited: false,
+            location: String::new(),
+            ip_location: String::new(),
+            likes: String::new(),
+            favorites: String::new(),
+            comments_count: String::new(),
+            image_count: 0,
+            images: Vec::new(),
+            // Keep video as {}, not null, so the wire shape stays consistent
+            // for video-less notes.
+            video: Value::Object(Default::default()),
+            wait_meta: None,
+            stale_warning: None,
+        }
+    }
+}
+
+/// Drop the URL fragment, keep scheme/netloc/path/query intact for the URL
+/// shapes XHS emits.
+pub(crate) fn normalize_url(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    match trimmed.find('#') {
+        Some(idx) => trimmed[..idx].to_string(),
+        None => trimmed.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_url_strips_fragment() {
+        assert_eq!(
+            normalize_url("https://www.xiaohongshu.com/explore/abc?x=1#frag"),
+            "https://www.xiaohongshu.com/explore/abc?x=1"
+        );
+    }
+
+    #[test]
+    fn normalize_url_passes_through_clean_urls() {
+        assert_eq!(
+            normalize_url("https://www.xiaohongshu.com/explore/abc?x=1"),
+            "https://www.xiaohongshu.com/explore/abc?x=1"
+        );
+    }
+
+    #[test]
+    fn normalize_url_handles_empty() {
+        assert_eq!(normalize_url(""), "");
+        assert_eq!(normalize_url("   "), "");
+    }
+
+    #[test]
+    fn parse_count_basic() {
+        assert_eq!(parse_count_text(""), 0);
+        assert_eq!(parse_count_text("0"), 0);
+        assert_eq!(parse_count_text("1234"), 1234);
+        assert_eq!(parse_count_text("1,234"), 1234);
+        assert_eq!(parse_count_text("999+"), 999);
+    }
+
+    #[test]
+    fn parse_count_chinese_wan() {
+        assert_eq!(parse_count_text("1万"), 10_000);
+        assert_eq!(parse_count_text("1.2万"), 12_000);
+        assert_eq!(parse_count_text("3.5w"), 35_000);
+    }
+
+    #[test]
+    fn parse_count_k_suffix() {
+        assert_eq!(parse_count_text("1.5k"), 1_500);
+        assert_eq!(parse_count_text("12K"), 12_000);
+    }
+
+    #[test]
+    fn parse_count_unparseable() {
+        assert_eq!(parse_count_text("none"), 0);
+        assert_eq!(parse_count_text("--"), 0);
+    }
+}

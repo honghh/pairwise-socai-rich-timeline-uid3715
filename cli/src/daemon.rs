@@ -1,0 +1,1024 @@
+use socai_core::telemetry::tool_call::{summarize_tool_args, summarize_tool_result};
+use socai_core::telemetry::{query_text_enabled, telemetry_enabled, Telemetry, TelemetrySource};
+
+use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
+use socai_core::agent::tool::{ToolProgressEvent, ToolProgressSender};
+use socai_core::runtime::SocaiRuntime;
+use socai_core::sites::{find_native_site_adapter, NativeSiteAdapter, SiteCommand};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::fs;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(windows)]
+use tokio::net::{TcpListener, TcpStream};
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::time::{sleep, timeout, Instant};
+
+pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
+pub const LONG_COMMAND_TIMEOUT: Duration = Duration::from_secs(1_200);
+
+#[cfg(windows)]
+type DaemonListener = TcpListener;
+#[cfg(windows)]
+type DaemonStream = TcpStream;
+#[cfg(unix)]
+type DaemonListener = UnixListener;
+#[cfg(unix)]
+type DaemonStream = UnixStream;
+
+#[cfg(unix)]
+const SOCKET_NAME: &str = "rust-daemon.sock";
+#[cfg(windows)]
+const ENDPOINT_NAME: &str = "rust-daemon-endpoint.json";
+const PID_NAME: &str = "rust-daemon.pid";
+const LOG_NAME: &str = "rust-daemon.log";
+const IDLE_TIMEOUT: Duration = Duration::from_secs(3 * 60 * 60);
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// The daemon only serves a CLI of the exact same build. A version mismatch
+/// is a hard error the user has to reconcile (update or rebuild); a same-
+/// version binary change (dev rebuild) restarts the daemon automatically.
+const PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
+const CODE_VERSION_MISMATCH: &str = "version-mismatch";
+const CODE_STALE_DAEMON: &str = "stale-daemon";
+
+static BUILD_ID: OnceLock<String> = OnceLock::new();
+
+/// Fingerprint (size + mtime) of the executable this process started from.
+/// The daemon pins it at startup — before a rebuild can swap the file under
+/// the same path — so comparing it against the calling CLI detects a stale
+/// daemon even when the package version did not change.
+fn process_build_id() -> &'static str {
+    BUILD_ID.get_or_init(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| std::fs::metadata(exe).ok())
+            .and_then(|meta| {
+                let mtime = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+                Some(format!("{}-{}", meta.len(), mtime.as_nanos()))
+            })
+            .unwrap_or_else(|| "unknown".to_string())
+    })
+}
+
+/// Daemon failures that need different client-side recovery: a version
+/// mismatch must fail, a stale daemon is restarted automatically.
+#[derive(Debug)]
+enum DaemonClientError {
+    VersionMismatch(String),
+    StaleDaemon(String),
+}
+
+impl std::fmt::Display for DaemonClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DaemonClientError::VersionMismatch(message)
+            | DaemonClientError::StaleDaemon(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for DaemonClientError {}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DaemonRequest {
+    id: String,
+    /// Site id the command belongs to. Empty (legacy clients) means "xhs".
+    #[serde(default)]
+    site: String,
+    command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auth: Option<String>,
+    /// CLI package version + binary fingerprint. Empty for legacy clients.
+    #[serde(default)]
+    version: String,
+    #[serde(default)]
+    build_id: String,
+    #[serde(default)]
+    args: Value,
+    #[serde(default)]
+    telemetry: DaemonTelemetry,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DaemonTelemetry {
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default = "default_true")]
+    include_query_text: bool,
+}
+
+impl Default for DaemonTelemetry {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            include_query_text: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DaemonResponse {
+    id: String,
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    /// Machine-readable failure class (e.g. version-mismatch, stale-daemon).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
+    /// Daemon build identity; missing on responses from legacy daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    build_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DaemonProgressFrame {
+    #[serde(rename = "type")]
+    kind: String,
+    id: String,
+    event: ToolProgressEvent,
+}
+
+enum DaemonLine {
+    Progress(ToolProgressEvent),
+    Response(DaemonResponse),
+}
+
+impl DaemonResponse {
+    fn success(id: String, result: Value) -> Self {
+        Self {
+            id,
+            ok: true,
+            result: Some(result),
+            error: None,
+            code: None,
+            version: Some(PROTOCOL_VERSION.to_string()),
+            build_id: Some(process_build_id().to_string()),
+        }
+    }
+
+    fn failure(id: String, code: Option<&str>, error: String) -> Self {
+        Self {
+            id,
+            ok: false,
+            result: None,
+            error: Some(error),
+            code: code.map(str::to_string),
+            version: Some(PROTOCOL_VERSION.to_string()),
+            build_id: Some(process_build_id().to_string()),
+        }
+    }
+}
+
+struct DaemonPaths {
+    home: PathBuf,
+    #[cfg(unix)]
+    socket: PathBuf,
+    #[cfg(windows)]
+    endpoint: PathBuf,
+    pid: PathBuf,
+    log: PathBuf,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Serialize, Deserialize)]
+struct DaemonEndpoint {
+    host: String,
+    port: u16,
+    token: String,
+}
+
+struct DaemonState {
+    runtime: SocaiRuntime,
+    telemetry: Telemetry,
+    auth_token: Option<String>,
+    last_activity: Instant,
+}
+
+pub async fn run_daemon() -> Result<()> {
+    // Pin the binary fingerprint before a rebuild can swap the file under us.
+    let _ = process_build_id();
+    let paths = daemon_paths()?;
+    fs::create_dir_all(&paths.home).await?;
+    cleanup_stale_ipc(&paths).await?;
+
+    let listener = bind_daemon_listener(&paths).await?;
+    let auth_token = daemon_auth_token();
+    write_daemon_endpoint(&paths, &listener, auth_token.as_deref()).await?;
+    fs::write(&paths.pid, std::process::id().to_string()).await?;
+
+    let runtime = SocaiRuntime::new();
+    // Kept outside the DaemonState mutex for the shutdown path below: a site
+    // command holds that mutex for its whole execution (minutes for e.g.
+    // wait-for-login), and shutdown must not queue behind it — the SIGTERM
+    // kill grace is 6 seconds. The handle is a cheap Arc-backed clone of the
+    // same runtime.
+    let runtime_for_shutdown = runtime.clone();
+    let telemetry = Telemetry::new(&paths.home, TelemetrySource::CliDaemon);
+    let state = Arc::new(Mutex::new(DaemonState {
+        runtime,
+        telemetry,
+        auth_token,
+        last_activity: Instant::now(),
+    }));
+    let stop = Arc::new(Notify::new());
+    let mut idle_check = tokio::time::interval(Duration::from_secs(60));
+    let terminate = terminate_signal();
+    tokio::pin!(terminate);
+
+    loop {
+        tokio::select! {
+            accept_result = listener.accept() => {
+                let (stream, _) = accept_result.context("accept daemon client")?;
+                let state = state.clone();
+                let stop = stop.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = serve_client(stream, state, stop).await {
+                        eprintln!("daemon client error: {err:#}");
+                    }
+                });
+            }
+            _ = idle_check.tick() => {
+                if state.lock().await.last_activity.elapsed() > IDLE_TIMEOUT {
+                    break;
+                }
+            }
+            _ = &mut terminate => break,
+            _ = stop.notified() => break,
+        }
+    }
+
+    // Unlink our IPC endpoint before the slow browser teardown: a successor
+    // daemon may bind a fresh socket at this path right away, and removing it
+    // after shutdown would yank the new daemon's endpoint from under it.
+    cleanup_stale_ipc(&paths).await?;
+    let _ = fs::remove_file(&paths.pid).await;
+    // Tear down directly on the runtime handle, not through the DaemonState
+    // mutex — an in-flight command may hold that mutex for minutes. Stopping
+    // means stopping: the browser is yanked from under any such command (it
+    // fails, the daemon exits), and the bounded remote-session release runs
+    // right away instead of after the command finishes. disconnect() itself
+    // sweeps socai-owned tabs (bounded, and skipped for remote sessions
+    // whose browser dies with the release) — an extra page-close pass here
+    // could stall ~30s per command against a wedged browser and eat the
+    // SIGTERM kill grace before the release starts.
+    runtime_for_shutdown.disconnect_browser().await;
+    Ok(())
+}
+
+/// Resolves when the daemon receives SIGTERM; pends forever on non-unix.
+/// `kill_stale_daemons` (and a plain `kill`) send SIGTERM expecting a graceful
+/// exit — without a handler the process dies before `shutdown()`, which for a
+/// remote browser session means no release and a session that runs out its
+/// full server-side timeout.
+async fn terminate_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        std::future::pending::<()>().await
+    }
+}
+
+pub async fn send_or_spawn(
+    site: &str,
+    command: &str,
+    args: Value,
+    command_timeout: Duration,
+    on_progress: &mut dyn FnMut(ToolProgressEvent),
+) -> Result<Value> {
+    let err = match send_request(site, command, args.clone(), command_timeout, on_progress).await {
+        Ok(result) => return Ok(result),
+        Err(err) => err,
+    };
+    match err.downcast_ref::<DaemonClientError>() {
+        // A different release serving this CLI is never acceptable — the user
+        // has to bring both onto the same version.
+        Some(DaemonClientError::VersionMismatch(_)) => return Err(err),
+        // Same version, different binary (typically a dev rebuild): replace
+        // the daemon so commands never run on stale code.
+        Some(DaemonClientError::StaleDaemon(_)) => {
+            eprintln!("socai daemon was started from a different build; restarting it");
+            let _ = stop_daemon().await;
+            wait_for_daemon_exit().await;
+        }
+        None => {}
+    }
+    spawn_daemon().await?;
+    send_request(site, command, args, command_timeout, on_progress).await
+}
+
+pub async fn stop_daemon() -> Result<bool> {
+    match send_request(
+        "",
+        "shutdown",
+        json!({}),
+        Duration::from_secs(10),
+        &mut |_| {},
+    )
+    .await
+    {
+        Ok(_) => Ok(true),
+        Err(_) => Ok(false),
+    }
+}
+
+async fn serve_client(
+    stream: DaemonStream,
+    state: Arc<Mutex<DaemonState>>,
+    stop: Arc<Notify>,
+) -> Result<()> {
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+
+    while reader.read_line(&mut line).await? != 0 {
+        let request: DaemonRequest = serde_json::from_str(line.trim_end())?;
+        let request_id = request.id.clone();
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        let mut disconnect_probe = String::new();
+        let response = handle_request(request, state.clone(), stop.clone(), Some(progress_tx));
+        tokio::pin!(response);
+        let disconnect = reader.read_line(&mut disconnect_probe);
+        tokio::pin!(disconnect);
+        let mut progress_open = true;
+        loop {
+            tokio::select! {
+                biased;
+                event = progress_rx.recv(), if progress_open => {
+                    match event {
+                        Some(event) => {
+                            let frame = DaemonProgressFrame {
+                                kind: "progress".to_string(),
+                                id: request_id.clone(),
+                                event,
+                            };
+                            writer
+                                .write_all(serde_json::to_string(&frame)?.as_bytes())
+                                .await?;
+                            writer.write_all(b"\n").await?;
+                        }
+                        None => progress_open = false,
+                    }
+                }
+                response = &mut response => {
+                    writer
+                        .write_all(serde_json::to_string(&response)?.as_bytes())
+                        .await?;
+                    writer.write_all(b"\n").await?;
+                    break;
+                }
+                read = &mut disconnect => {
+                    if read? == 0 {
+                        return Ok(());
+                    }
+                    anyhow::bail!("daemon client sent another request before the previous response");
+                }
+            }
+        }
+        line.clear();
+    }
+
+    Ok(())
+}
+
+async fn handle_request(
+    request: DaemonRequest,
+    state: Arc<Mutex<DaemonState>>,
+    stop: Arc<Notify>,
+    progress: Option<ToolProgressSender>,
+) -> DaemonResponse {
+    let id = request.id.clone();
+    let command = request.command.clone();
+    let telemetry = request.telemetry.clone();
+    let auth_token = { state.lock().await.auth_token.clone() };
+    if !daemon_request_authorized(request.auth.as_deref(), auth_token.as_deref()) {
+        return DaemonResponse::failure(id, None, "daemon authentication failed".into());
+    }
+
+    // Site commands only run for a CLI of the exact same build. ping and
+    // shutdown stay exempt so `socai stop` works across any version pairing.
+    if !matches!(command.as_str(), "ping" | "shutdown") {
+        if request.version != PROTOCOL_VERSION {
+            let cli_version = if request.version.is_empty() {
+                "<unknown>"
+            } else {
+                request.version.as_str()
+            };
+            return DaemonResponse::failure(
+                id,
+                Some(CODE_VERSION_MISMATCH),
+                format!(
+                    "socai daemon {PROTOCOL_VERSION} cannot serve CLI {cli_version}; \
+                     run `socai stop`, then update or rebuild so both use the same version"
+                ),
+            );
+        }
+        if request.build_id != process_build_id() {
+            return DaemonResponse::failure(
+                id,
+                Some(CODE_STALE_DAEMON),
+                format!(
+                    "socai daemon was started from a different build of {PROTOCOL_VERSION} \
+                     (the binary changed since it started)"
+                ),
+            );
+        }
+    }
+
+    let result = async {
+        if command == "ping" {
+            return Ok(json!({ "ok": true }));
+        }
+
+        if command == "shutdown" {
+            stop.notify_waiters();
+            return Ok(json!({ "ok": true }));
+        }
+
+        let site_id = if request.site.trim().is_empty() {
+            "xhs"
+        } else {
+            request.site.trim()
+        };
+        let site =
+            find_native_site_adapter(site_id).ok_or_else(|| anyhow!("unknown site: {site_id}"))?;
+        let spec = site
+            .command(&command)
+            .ok_or_else(|| anyhow!("unknown {site_id} command: {command}"))?;
+
+        let mut state = state.lock().await;
+        state.last_activity = Instant::now();
+        state
+            .run_site_command(&id, site, spec, request.args, &telemetry, progress)
+            .await
+    }
+    .await;
+
+    match result {
+        Ok(result) => DaemonResponse::success(id, result),
+        Err(err) => DaemonResponse::failure(id, None, format!("{err:#}")),
+    }
+}
+
+#[cfg(unix)]
+fn daemon_request_authorized(_request_auth: Option<&str>, _daemon_auth: Option<&str>) -> bool {
+    true
+}
+
+#[cfg(windows)]
+fn daemon_request_authorized(request_auth: Option<&str>, daemon_auth: Option<&str>) -> bool {
+    request_auth.is_some() && request_auth == daemon_auth
+}
+
+impl DaemonState {
+    async fn run_site_command(
+        &mut self,
+        request_id: &str,
+        site: &'static NativeSiteAdapter,
+        spec: &'static SiteCommand,
+        args: Value,
+        telemetry: &DaemonTelemetry,
+        progress: Option<ToolProgressSender>,
+    ) -> Result<Value> {
+        let started = Instant::now();
+        // Marks browser work in flight for the whole command, so the remote
+        // idle reaper never releases the session under a running tool.
+        let _activity = self.runtime.begin_activity().await;
+        let result = async {
+            let debug_snapshot = debug_snapshot_flag(&args);
+            // Create the session tab blank and let the command navigate itself:
+            // every site command either opens its own entry URL (e.g. `author`
+            // opens the profile directly) or has a `before` hook that reaches
+            // the right page (search via ensure_search_ready). Passing
+            // home_url here would force an extra `/explore` load before the
+            // command then navigates again — wasted time for no benefit.
+            let page = self.runtime.ensure_site_page(site.id, "").await?;
+            (spec.run)(page, args.clone(), debug_snapshot, progress).await
+        }
+        .await;
+        self.track_tool_trace(
+            request_id,
+            site.id,
+            spec.name,
+            spec.tool_name,
+            &args,
+            telemetry,
+            started,
+            &result,
+        );
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn track_tool_trace(
+        &self,
+        request_id: &str,
+        site_id: &str,
+        command: &str,
+        tool_name: &str,
+        input: &Value,
+        telemetry: &DaemonTelemetry,
+        started: Instant,
+        result: &Result<Value>,
+    ) {
+        if !telemetry.enabled {
+            return;
+        }
+
+        let mut props = base_trace_props(request_id, site_id, command, tool_name);
+        props.insert(
+            "duration_ms".into(),
+            json!(started.elapsed().as_millis() as u64),
+        );
+        merge_object(
+            &mut props,
+            Value::Object(summarize_tool_args(input, telemetry.include_query_text)),
+        );
+        match result {
+            Ok(value) => {
+                props.insert("ok".into(), json!(true));
+                merge_object(&mut props, Value::Object(summarize_tool_result(value)));
+            }
+            Err(err) => {
+                props.insert("ok".into(), json!(false));
+                props.insert("error".into(), json!(error_summary(err)));
+            }
+        }
+
+        self.telemetry
+            .capture("socai_tool_call", Value::Object(props));
+    }
+
+}
+
+fn base_trace_props(
+    request_id: &str,
+    site_id: &str,
+    command: &str,
+    tool_name: &str,
+) -> Map<String, Value> {
+    let mut props = Map::new();
+    props.insert("request_id".into(), json!(request_id));
+    props.insert("command".into(), json!(command));
+    props.insert("tool_name".into(), json!(tool_name));
+    props.insert("site".into(), json!(site_id));
+    props
+}
+
+fn merge_object(target: &mut Map<String, Value>, value: Value) {
+    let Value::Object(map) = value else {
+        return;
+    };
+    for (key, value) in map {
+        target.insert(key, value);
+    }
+}
+
+fn error_summary(err: &anyhow::Error) -> String {
+    let rendered = format!("{err:#}");
+    let first = rendered.lines().next().unwrap_or("command failed").trim();
+    first.chars().take(240).collect()
+}
+
+async fn send_request(
+    site: &str,
+    command: &str,
+    args: Value,
+    request_timeout: Duration,
+    on_progress: &mut dyn FnMut(ToolProgressEvent),
+) -> Result<Value> {
+    let paths = daemon_paths()?;
+    let (stream, auth) = connect_daemon(&paths).await?;
+    let request = DaemonRequest {
+        id: request_id(),
+        site: site.to_string(),
+        command: command.to_string(),
+        auth,
+        version: PROTOCOL_VERSION.to_string(),
+        build_id: process_build_id().to_string(),
+        args,
+        telemetry: DaemonTelemetry {
+            enabled: telemetry_enabled(),
+            include_query_text: query_text_enabled(),
+        },
+    };
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+
+    timeout(request_timeout, async {
+        writer
+            .write_all(serde_json::to_string(&request)?.as_bytes())
+            .await?;
+        writer.write_all(b"\n").await?;
+        loop {
+            line.clear();
+            let read = reader.read_line(&mut line).await?;
+            if read == 0 || line.trim().is_empty() {
+                return Err(anyhow!("empty daemon response"));
+            }
+            let response = match parse_daemon_line(line.trim_end())? {
+                DaemonLine::Progress(event) => {
+                    on_progress(event);
+                    continue;
+                }
+                DaemonLine::Response(response) => response,
+            };
+            if !response.ok {
+                let message = response
+                    .error
+                    .unwrap_or_else(|| "daemon command failed".to_string());
+                return Err(match response.code.as_deref() {
+                    Some(CODE_VERSION_MISMATCH) => {
+                        anyhow::Error::new(DaemonClientError::VersionMismatch(message))
+                    }
+                    Some(CODE_STALE_DAEMON) => {
+                        anyhow::Error::new(DaemonClientError::StaleDaemon(message))
+                    }
+                    _ => anyhow!("{message}"),
+                });
+            }
+            // Legacy daemons (pre build checking) execute commands without
+            // validating; their responses lack the build identity. Treat them as
+            // stale so they get replaced rather than silently serving old code.
+            if !matches!(command, "ping" | "shutdown")
+                && (response.version.as_deref() != Some(PROTOCOL_VERSION)
+                    || response.build_id.as_deref() != Some(process_build_id()))
+            {
+                return Err(anyhow::Error::new(DaemonClientError::StaleDaemon(
+                    "socai daemon predates build checking or runs a different build".to_string(),
+                )));
+            }
+            return response
+                .result
+                .ok_or_else(|| anyhow!("daemon response missing result"));
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("daemon request timed out after {:?}", request_timeout))?
+}
+
+fn parse_daemon_line(line: &str) -> Result<DaemonLine> {
+    let value: Value = serde_json::from_str(line)?;
+    if value.get("type").and_then(Value::as_str) == Some("progress") {
+        let frame: DaemonProgressFrame = serde_json::from_value(value)?;
+        return Ok(DaemonLine::Progress(frame.event));
+    }
+    Ok(DaemonLine::Response(serde_json::from_value(value)?))
+}
+
+async fn spawn_daemon() -> Result<()> {
+    let paths = daemon_paths()?;
+    fs::create_dir_all(&paths.home).await?;
+    cleanup_stale_ipc(&paths).await?;
+
+    spawn_detached_subcommand("__daemon", &paths.log, |_| {})?;
+
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    while Instant::now() < deadline {
+        if send_request("", "ping", json!({}), Duration::from_secs(2), &mut |_| {})
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+
+    Err(anyhow!(
+        "socai rust daemon did not become ready; see {}",
+        paths.log.display()
+    ))
+}
+
+#[cfg(unix)]
+async fn bind_daemon_listener(paths: &DaemonPaths) -> Result<DaemonListener> {
+    UnixListener::bind(&paths.socket)
+        .with_context(|| format!("bind daemon socket {}", paths.socket.display()))
+}
+
+#[cfg(windows)]
+async fn bind_daemon_listener(_paths: &DaemonPaths) -> Result<DaemonListener> {
+    TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .context("bind daemon TCP listener")
+}
+
+#[cfg(unix)]
+async fn write_daemon_endpoint(
+    _paths: &DaemonPaths,
+    _listener: &DaemonListener,
+    _auth_token: Option<&str>,
+) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn write_daemon_endpoint(
+    paths: &DaemonPaths,
+    listener: &DaemonListener,
+    auth_token: Option<&str>,
+) -> Result<()> {
+    let endpoint = DaemonEndpoint {
+        host: "127.0.0.1".into(),
+        port: listener.local_addr()?.port(),
+        token: auth_token
+            .ok_or_else(|| anyhow!("missing daemon auth token"))?
+            .to_string(),
+    };
+    fs::write(&paths.endpoint, serde_json::to_vec_pretty(&endpoint)?)
+        .await
+        .with_context(|| format!("write daemon endpoint {}", paths.endpoint.display()))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn connect_daemon(paths: &DaemonPaths) -> Result<(DaemonStream, Option<String>)> {
+    let stream = UnixStream::connect(&paths.socket)
+        .await
+        .with_context(|| format!("connect daemon socket {}", paths.socket.display()))?;
+    Ok((stream, None))
+}
+
+#[cfg(windows)]
+async fn connect_daemon(paths: &DaemonPaths) -> Result<(DaemonStream, Option<String>)> {
+    let text = fs::read_to_string(&paths.endpoint)
+        .await
+        .with_context(|| format!("read daemon endpoint {}", paths.endpoint.display()))?;
+    let endpoint: DaemonEndpoint = serde_json::from_str(&text)
+        .with_context(|| format!("parse daemon endpoint {}", paths.endpoint.display()))?;
+    let stream = TcpStream::connect((endpoint.host.as_str(), endpoint.port))
+        .await
+        .with_context(|| {
+            format!(
+                "connect daemon TCP listener {}:{}",
+                endpoint.host, endpoint.port
+            )
+        })?;
+    Ok((stream, Some(endpoint.token)))
+}
+
+/// Give a just-stopped daemon a moment to unlink its IPC endpoint so the
+/// successor's pre-spawn cleanup doesn't race its exit cleanup.
+async fn wait_for_daemon_exit() {
+    let Ok(paths) = daemon_paths() else { return };
+    #[cfg(unix)]
+    let marker = paths.socket.clone();
+    #[cfg(windows)]
+    let marker = paths.endpoint.clone();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while marker.exists() && Instant::now() < deadline {
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[cfg(unix)]
+async fn cleanup_stale_ipc(paths: &DaemonPaths) -> Result<()> {
+    // A just-stopped daemon races us removing the same socket (its exit
+    // cleanup vs our pre-spawn cleanup), so a missing file is success.
+    match fs::remove_file(&paths.socket).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => {
+            Err(err).with_context(|| format!("remove stale socket {}", paths.socket.display()))
+        }
+    }
+}
+
+#[cfg(windows)]
+async fn cleanup_stale_ipc(paths: &DaemonPaths) -> Result<()> {
+    let _ = fs::remove_file(&paths.endpoint).await;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn daemon_auth_token() -> Option<String> {
+    None
+}
+
+#[cfg(windows)]
+fn daemon_auth_token() -> Option<String> {
+    Some(uuid::Uuid::new_v4().to_string())
+}
+
+fn debug_snapshot_flag(args: &Value) -> bool {
+    args.get("debug_snapshot")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Spawn `socai <subcommand>` as a detached background process (own session
+/// on unix) with stdout/stderr appended to `log_path`. `configure` can adjust
+/// the command (e.g. env) before spawning. Used by the daemon to relaunch
+/// itself detached.
+pub(crate) fn spawn_detached_subcommand(
+    subcommand: &str,
+    log_path: &std::path::Path,
+    configure: impl FnOnce(&mut std::process::Command),
+) -> Result<std::process::Child> {
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .with_context(|| format!("open log {}", log_path.display()))?;
+    let stderr = log.try_clone()?;
+
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command
+        .arg(subcommand)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(stderr));
+    configure(&mut command);
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command
+        .spawn()
+        .with_context(|| format!("spawn socai {subcommand}"))
+}
+
+/// The socai state dir (`$SOCAI_HOME` or `~/.socai`).
+pub(crate) fn socai_home() -> Result<PathBuf> {
+    match std::env::var_os("SOCAI_HOME") {
+        Some(path) => Ok(PathBuf::from(path)),
+        None => Ok(home_dir()
+            .context("could not locate user home directory for ~/.socai")?
+            .join(".socai")),
+    }
+}
+
+fn daemon_paths() -> Result<DaemonPaths> {
+    let home = socai_home()?;
+
+    Ok(DaemonPaths {
+        #[cfg(unix)]
+        socket: home.join(SOCKET_NAME),
+        #[cfg(windows)]
+        endpoint: home.join(ENDPOINT_NAME),
+        pid: home.join(PID_NAME),
+        log: home.join(LOG_NAME),
+        home,
+    })
+}
+
+fn home_dir() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("HOME") {
+        return Some(PathBuf::from(home));
+    }
+    #[cfg(windows)]
+    {
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            return Some(PathBuf::from(profile));
+        }
+        let drive = std::env::var_os("HOMEDRIVE")?;
+        let path = std::env::var_os("HOMEPATH")?;
+        return Some(PathBuf::from(format!(
+            "{}{}",
+            drive.to_string_lossy(),
+            path.to_string_lossy()
+        )));
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+fn request_id() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    format!("{}-{millis}", std::process::id())
+}
+
+/// Best-effort sweep: terminate every lingering socai `__daemon` process, no
+/// matter which binary or `SOCAI_HOME` spawned it. The graceful socket shutdown
+/// only reaches whoever currently owns the IPC endpoint, so this catches
+/// orphans left by restart races or crashes. Returns the number of processes
+/// signalled.
+pub async fn kill_lingering_helpers() -> usize {
+    let pids = lingering_helper_pids();
+    if pids.is_empty() {
+        return 0;
+    }
+    for pid in &pids {
+        signal_pid(*pid, false);
+    }
+    // Wait for graceful exits before escalating. SIGTERM routes daemons
+    // through browser teardown, whose worst-case chain is bounded in the
+    // core: owned-tab close (≤5s, local browsers only) + awaited remote
+    // release (≤5s) + the connect-settle wait for a mid-flight connect
+    // attempt (≤8s) ≈ 18s. The grace must outlast that whole chain — a
+    // SIGKILL landing inside it recreates the timed-out-session leak this
+    // teardown exists to prevent. Healthy daemons exit in well under a
+    // second, so the poll usually ends on its first iterations; the full
+    // wait is only ever paid for genuinely wedged processes.
+    const KILL_GRACE: Duration = Duration::from_secs(20);
+    const KILL_POLL: Duration = Duration::from_millis(200);
+    let deadline = Instant::now() + KILL_GRACE;
+    while Instant::now() < deadline {
+        if pids.iter().all(|pid| !pid_alive(*pid)) {
+            return pids.len();
+        }
+        sleep(KILL_POLL).await;
+    }
+    for pid in &pids {
+        if pid_alive(*pid) {
+            signal_pid(*pid, true);
+        }
+    }
+    pids.len()
+}
+
+/// Whether a process still exists, probed with the null signal.
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    // Safe FFI: kill() with signal 0 checks existence without delivering
+    // anything. EPERM would also mean "exists", but socai daemons run as the
+    // caller's own user, so a plain success check suffices.
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+#[cfg(not(unix))]
+fn pid_alive(_pid: u32) -> bool {
+    false
+}
+
+/// PIDs of running `socai __daemon` processes (excluding the caller).
+/// Identified by command line so it spans every install path.
+#[cfg(unix)]
+fn lingering_helper_pids() -> Vec<u32> {
+    let me = std::process::id();
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-axo", "pid=,command="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_start();
+            let (pid_str, cmd) = line.split_once(' ')?;
+            let pid: u32 = pid_str.trim().parse().ok()?;
+            if pid == me {
+                return None;
+            }
+            // The binary is always named `socai`; matching the exact
+            // `socai __daemon` tail avoids hitting the `socai stop` process or
+            // unrelated programs.
+            cmd.contains("socai __daemon").then_some(pid)
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn lingering_helper_pids() -> Vec<u32> {
+    // No cheap command-line process filter on Windows; the graceful socket
+    // shutdown remains the stop path there.
+    Vec::new()
+}
+
+#[cfg(unix)]
+fn signal_pid(pid: u32, force: bool) {
+    let sig = if force { libc::SIGKILL } else { libc::SIGTERM };
+    // Safe FFI: kill() with a signal number; failures (already exited, not
+    // ours) are ignored on purpose.
+    unsafe {
+        libc::kill(pid as libc::pid_t, sig);
+    }
+}
+
+#[cfg(windows)]
+fn signal_pid(_pid: u32, _force: bool) {}

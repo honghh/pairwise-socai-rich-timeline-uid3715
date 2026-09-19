@@ -1,0 +1,1406 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: semantic version bump for this release
+        type: choice
+        required: true
+        default: patch
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: prepare release version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      previous_tag: ${{ steps.version.outputs.previous_tag }}
+      base_sha: ${{ steps.base.outputs.base_sha }}
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: validate release ref
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "${GITHUB_REF}" in
+            refs/heads/main)
+              echo "publishing release from main"
+              ;;
+            refs/heads/fix/release-*)
+              echo "test release run from ${GITHUB_REF}; publish job will be skipped"
+              ;;
+            *)
+              echo "releases must be dispatched from main or fix/release-*; current ref is ${GITHUB_REF}" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: record release base commit
+        id: base
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_sha="$(git rev-parse HEAD)"
+          echo "base_sha=${base_sha}"
+          echo "base_sha=${base_sha}" >> "${GITHUB_OUTPUT}"
+
+      - name: calculate next version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          latest_tag="$(git tag --list 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)"
+
+          if [ -n "${latest_tag}" ]; then
+            base_version="${latest_tag#v}"
+            previous_tag="${latest_tag}"
+          else
+            base_version="$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+          print(json.loads(Path('app/src-tauri/tauri.conf.json').read_text())['version'])
+          PY
+          )"
+            previous_tag=""
+          fi
+
+          if [[ ! "${base_version}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "base version must be strict MAJOR.MINOR.PATCH semver, got: ${base_version}" >&2
+            exit 1
+          fi
+
+          major="${BASH_REMATCH[1]}"
+          minor="${BASH_REMATCH[2]}"
+          patch="${BASH_REMATCH[3]}"
+
+          case "${{ inputs.release_type }}" in
+            major)
+              major=$((major + 1))
+              minor=0
+              patch=0
+              ;;
+            minor)
+              minor=$((minor + 1))
+              patch=0
+              ;;
+            patch)
+              patch=$((patch + 1))
+              ;;
+            *)
+              echo "unsupported release type: ${{ inputs.release_type }}" >&2
+              exit 1
+              ;;
+          esac
+
+          version="${major}.${minor}.${patch}"
+          tag="v${version}"
+
+          if git rev-parse "${tag}" >/dev/null 2>&1; then
+            echo "tag ${tag} already exists" >&2
+            exit 1
+          fi
+
+          echo "base_version=${base_version}"
+          echo "previous_tag=${previous_tag}"
+          echo "version=${version}"
+          echo "tag=${tag}"
+
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "previous_tag=${previous_tag}" >> "${GITHUB_OUTPUT}"
+
+  build-macos-cli:
+    name: build macOS CLI
+    needs: prepare
+    runs-on: macos-14
+
+    steps:
+      - name: checkout release base commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.base_sha }}
+
+      - name: apply release version
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          python3 .github/scripts/set-app-version.py "${VERSION}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml app/package.json app/src-tauri/tauri.conf.json app/src-tauri/Cargo.toml Cargo.lock
+          git commit -m "chore: release socai v${VERSION}"
+          versioned_sha="$(git rev-parse HEAD)"
+          echo "SOCAI_BUILD_SHA=${versioned_sha}" >> "${GITHUB_ENV}"
+          echo "versioned build tree ${versioned_sha}"
+
+      - name: set up rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: cache rust build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+          key: macos-cli-universal
+
+      - name: clear stale CLI outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf target/socai-cli-macos-universal
+
+      - name: build CLI universal binary
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SOCAI_PRO_BASE_URL: ${{ secrets.SOCAI_PRO_BASE_URL }}
+        run: |
+          set -euo pipefail
+
+          node scripts/prepare-sherpa-onnx-libs.mjs aarch64-apple-darwin x86_64-apple-darwin
+          export SHERPA_ONNX_ARCHIVE_DIR="$PWD/target/sherpa-onnx-archives"
+          cargo build -p socai-cli --release --target aarch64-apple-darwin
+          cargo build -p socai-cli --release --target x86_64-apple-darwin
+          cargo build -p socai-asr --release --target aarch64-apple-darwin
+          cargo build -p socai-asr --release --target x86_64-apple-darwin
+
+          cli_dir="target/socai-cli-macos-universal"
+          mkdir -p "${cli_dir}"
+          lipo -create \
+            target/aarch64-apple-darwin/release/socai \
+            target/x86_64-apple-darwin/release/socai \
+            -output "${cli_dir}/socai"
+          lipo -create \
+            target/aarch64-apple-darwin/release/socai-asr \
+            target/x86_64-apple-darwin/release/socai-asr \
+            -output "${cli_dir}/socai-asr"
+          chmod 0755 "${cli_dir}/socai"
+          chmod 0755 "${cli_dir}/socai-asr"
+
+          for binary in socai socai-asr; do
+            actual_archs="$(lipo -archs "${cli_dir}/${binary}")"
+            echo "${cli_dir}/${binary} architectures: ${actual_archs}"
+            for expected_arch in arm64 x86_64; do
+              if [[ " ${actual_archs} " != *" ${expected_arch} "* ]]; then
+                echo "expected ${cli_dir}/${binary} to include ${expected_arch}, got: ${actual_archs}" >&2
+                exit 1
+              fi
+            done
+          done
+
+          version_output="$("${cli_dir}/socai" --version)"
+          echo "${version_output}"
+          if [ "${version_output}" != "socai ${VERSION}" ]; then
+            echo "expected CLI version 'socai ${VERSION}', got: ${version_output}" >&2
+            exit 1
+          fi
+
+      - name: collect distributable artifacts
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+
+          BUILD_SHA="${SOCAI_BUILD_SHA:?SOCAI_BUILD_SHA not set by apply release version step}"
+          cli_binary="target/socai-cli-macos-universal/socai"
+          asr_binary="target/socai-cli-macos-universal/socai-asr"
+          mkdir -p dist-artifacts
+
+          if [ ! -x "${cli_binary}" ]; then
+            echo "no CLI binary found at ${cli_binary}" >&2
+            exit 1
+          fi
+          if [ ! -x "${asr_binary}" ]; then
+            echo "no local ASR helper found at ${asr_binary}" >&2
+            exit 1
+          fi
+
+          package_dir="${RUNNER_TEMP}/socai-cli-package"
+          rm -rf "${package_dir}"
+          mkdir -p "${package_dir}"
+          cp "${cli_binary}" "${package_dir}/socai"
+          cp "${asr_binary}" "${package_dir}/socai-asr"
+          chmod 0755 "${package_dir}/socai"
+          chmod 0755 "${package_dir}/socai-asr"
+          created_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          cat > "${package_dir}/manifest.json" <<EOF
+          {
+            "base_sha": "${BASE_SHA}",
+            "created_at": "${created_at}",
+            "git_sha": "${BUILD_SHA}",
+            "target": "macos-universal",
+            "version": "${VERSION}"
+          }
+          EOF
+
+          tar -C "${package_dir}" -czf dist-artifacts/socai-cli-macos-universal.tar.gz socai socai-asr manifest.json
+          (cd dist-artifacts && shasum -a 256 socai-cli-macos-universal.tar.gz > socai-cli-macos-universal.tar.gz.sha256)
+          cp scripts/install-cli.sh dist-artifacts/install.sh
+
+          (cd dist-artifacts && shasum -a 256 -c socai-cli-macos-universal.tar.gz.sha256)
+          archive_listing="${RUNNER_TEMP}/socai-cli-archive-files.txt"
+          tar -tzf dist-artifacts/socai-cli-macos-universal.tar.gz > "${archive_listing}"
+          for required_file in socai socai-asr manifest.json; do
+            if ! grep -Fxq "${required_file}" "${archive_listing}"; then
+              echo "CLI archive missing ${required_file}" >&2
+              exit 1
+            fi
+          done
+          manifest_path="${RUNNER_TEMP}/socai-cli-manifest.json"
+          tar -xOzf dist-artifacts/socai-cli-macos-universal.tar.gz manifest.json > "${manifest_path}"
+          grep -F "\"version\": \"${VERSION}\"" "${manifest_path}"
+          grep -F "\"target\": \"macos-universal\"" "${manifest_path}"
+          grep -F "\"git_sha\": \"${BUILD_SHA}\"" "${manifest_path}"
+          grep -F "\"base_sha\": \"${BASE_SHA}\"" "${manifest_path}"
+          grep -F '"created_at":' "${manifest_path}"
+
+          ls -lah dist-artifacts
+
+      - name: upload build artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: socai-${{ needs.prepare.outputs.version }}-macos-cli
+          path: dist-artifacts/*
+          if-no-files-found: error
+
+  build-macos-app-dmg:
+    name: build macOS app DMG
+    needs: prepare
+    runs-on: macos-14
+    env:
+      TARGET: universal-apple-darwin
+
+    steps:
+      - name: checkout release base commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.base_sha }}
+
+      - name: apply release version
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          python3 .github/scripts/set-app-version.py "${VERSION}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml app/package.json app/src-tauri/tauri.conf.json app/src-tauri/Cargo.toml Cargo.lock
+          git commit -m "chore: release socai v${VERSION}"
+          versioned_sha="$(git rev-parse HEAD)"
+          echo "SOCAI_BUILD_SHA=${versioned_sha}" >> "${GITHUB_ENV}"
+          echo "versioned build tree ${versioned_sha}"
+
+      - name: set up pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 10.28.2
+          run_install: false
+
+      - name: set up node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+
+      - name: install frontend dependencies
+        working-directory: app
+        run: pnpm install --frozen-lockfile
+
+      - name: set up rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: cache rust build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+          key: macos-app-universal
+
+      - name: clear stale bundle outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "target/${TARGET}/release/bundle"
+
+      - name: configure macos signing
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          config_path="app/tauri.release-signing.conf.json"
+          cert_configured=false
+          notarization_configured=false
+          apple_id_auth_configured=false
+          api_key_auth_configured=false
+          api_key_path=""
+
+          add_env() {
+            name="$1"
+            value="$2"
+            delimiter="EOF_$(uuidgen | tr -d '-')"
+            {
+              echo "${name}<<${delimiter}"
+              printf '%s\n' "${value}"
+              echo "${delimiter}"
+            } >> "${GITHUB_ENV}"
+          }
+
+          if [ -n "${APPLE_CERTIFICATE:-}" ] && [ -n "${APPLE_CERTIFICATE_PASSWORD:-}" ] && [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
+            cert_configured=true
+          fi
+
+          if [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_PASSWORD:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ]; then
+            apple_id_auth_configured=true
+            notarization_configured=true
+          fi
+
+          if [ -n "${APPLE_API_KEY:-}" ] && [ -n "${APPLE_API_ISSUER:-}" ] && [ -n "${APPLE_API_KEY_P8:-}" ]; then
+            api_key_path="${RUNNER_TEMP}/AuthKey_${APPLE_API_KEY}.p8"
+            printf '%s' "${APPLE_API_KEY_P8}" > "${api_key_path}"
+            chmod 600 "${api_key_path}"
+            api_key_auth_configured=true
+            notarization_configured=true
+          fi
+
+          if [ "${cert_configured}" = "true" ] && [ "${notarization_configured}" = "true" ]; then
+            add_env APPLE_CERTIFICATE "${APPLE_CERTIFICATE}"
+            add_env APPLE_CERTIFICATE_PASSWORD "${APPLE_CERTIFICATE_PASSWORD}"
+            add_env APPLE_SIGNING_IDENTITY "${APPLE_SIGNING_IDENTITY}"
+
+            if [ "${apple_id_auth_configured}" = "true" ]; then
+              add_env APPLE_ID "${APPLE_ID}"
+              add_env APPLE_PASSWORD "${APPLE_PASSWORD}"
+              add_env APPLE_TEAM_ID "${APPLE_TEAM_ID}"
+            elif [ "${api_key_auth_configured}" = "true" ]; then
+              add_env APPLE_API_KEY "${APPLE_API_KEY}"
+              add_env APPLE_API_ISSUER "${APPLE_API_ISSUER}"
+              add_env APPLE_API_KEY_PATH "${api_key_path}"
+            fi
+
+            python3 - "${config_path}" "${APPLE_SIGNING_IDENTITY}" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          signing_identity = sys.argv[2]
+          path.write_text(json.dumps({"bundle": {"macOS": {"signingIdentity": signing_identity}}}) + "\n")
+          PY
+            echo "MACOS_SIGNING_MODE=developer-id" >> "${GITHUB_ENV}"
+            echo "using Developer ID signing and notarization"
+          else
+            if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+              echo "main releases require Developer ID signing and notarization secrets" >&2
+              echo "required: APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY" >&2
+              echo "and either APPLE_ID + APPLE_PASSWORD + APPLE_TEAM_ID or APPLE_API_KEY + APPLE_API_ISSUER + APPLE_API_KEY_P8" >&2
+              exit 1
+            fi
+
+            python3 - "${config_path}" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          path.write_text(json.dumps({"bundle": {"macOS": {"signingIdentity": "-"}}}) + "\n")
+          PY
+            echo "MACOS_SIGNING_MODE=ad-hoc" >> "${GITHUB_ENV}"
+            echo "using ad-hoc signing for branch test build; Gatekeeper will still warn"
+          fi
+
+          # Desktop auto-updater signing (minisign) — independent of Apple signing.
+          # The updater verifies each release against the pubkey baked into
+          # tauri.conf.json, so the matching private key must sign the tarball.
+          if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ] && [ -n "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" ]; then
+            add_env TAURI_SIGNING_PRIVATE_KEY "${TAURI_SIGNING_PRIVATE_KEY}"
+            add_env TAURI_SIGNING_PRIVATE_KEY_PASSWORD "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD}"
+            echo "TAURI_UPDATER_SIGNING=enabled" >> "${GITHUB_ENV}"
+            echo "updater artifact signing enabled"
+          elif [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            echo "main releases require TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD secrets for the desktop auto-updater" >&2
+            exit 1
+          else
+            echo "TAURI_UPDATER_SIGNING=disabled" >> "${GITHUB_ENV}"
+            echo "no updater signing key for this branch build; updater artifacts will be skipped"
+          fi
+
+      - name: build app bundle and dmg
+        working-directory: app
+        env:
+          SOCAI_PRO_BASE_URL: ${{ secrets.SOCAI_PRO_BASE_URL }}
+        run: |
+          pnpm exec tauri build \
+            --ci \
+            --target "${TARGET}" \
+            --bundles app,dmg \
+            --config tauri.release-signing.conf.json
+
+      - name: notarize and staple app and dmg
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${MACOS_SIGNING_MODE}" != "developer-id" ]; then
+            echo "skipping notarization for ${MACOS_SIGNING_MODE} build"
+            exit 0
+          fi
+
+          bundle_dir="target/${TARGET}/release/bundle"
+          app_bundle="${bundle_dir}/macos/socai.app"
+          dmg_dir="${bundle_dir}/dmg"
+          dmg="$(find "${dmg_dir}" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+
+          if [ ! -d "${app_bundle}" ]; then
+            echo "no app bundle found at ${app_bundle}" >&2
+            exit 1
+          fi
+
+          if [ -z "${dmg}" ]; then
+            echo "no dmg found in ${dmg_dir}" >&2
+            exit 1
+          fi
+
+          auth_args=()
+          if [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_PASSWORD:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ]; then
+            auth_args=(--apple-id "${APPLE_ID}" --password "${APPLE_PASSWORD}" --team-id "${APPLE_TEAM_ID}")
+          elif [ -n "${APPLE_API_KEY:-}" ] && [ -n "${APPLE_API_ISSUER:-}" ] && [ -n "${APPLE_API_KEY_PATH:-}" ]; then
+            auth_args=(--key "${APPLE_API_KEY_PATH}" --key-id "${APPLE_API_KEY}" --issuer "${APPLE_API_ISSUER}")
+          else
+            echo "developer-id notarization requires Apple ID or App Store Connect API credentials" >&2
+            exit 1
+          fi
+
+          # Notarize + staple the .app first: the auto-updater swaps in this
+          # bundle directly (outside the dmg), so the staple must live in the app.
+          app_zip="${RUNNER_TEMP}/socai-app-notarize.zip"
+          rm -f "${app_zip}"
+          echo "submitting ${app_bundle} for app notarization"
+          ditto -c -k --keepParent "${app_bundle}" "${app_zip}"
+          xcrun notarytool submit "${app_zip}" "${auth_args[@]}" --wait
+          xcrun stapler staple "${app_bundle}"
+          xcrun stapler validate "${app_bundle}"
+
+          echo "submitting ${dmg} for dmg notarization"
+          xcrun notarytool submit "${dmg}" "${auth_args[@]}" --wait
+          xcrun stapler staple "${dmg}"
+          xcrun stapler validate "${dmg}"
+
+      - name: verify app bundle and dmg
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          bundle_dir="target/${TARGET}/release/bundle"
+          app_bundle="${bundle_dir}/macos/socai.app"
+          dmg_dir="${bundle_dir}/dmg"
+          dmg="$(find "${dmg_dir}" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+
+          if [ ! -d "${app_bundle}" ]; then
+            echo "no app bundle found at ${app_bundle}" >&2
+            exit 1
+          fi
+
+          if [ -z "${dmg}" ]; then
+            echo "no dmg found in ${dmg_dir}" >&2
+            exit 1
+          fi
+
+          codesign --verify --deep --strict --verbose=2 "${app_bundle}"
+          if [ "${MACOS_SIGNING_MODE}" = "developer-id" ]; then
+            spctl -a -vvv -t execute "${app_bundle}"
+            xcrun stapler validate "${app_bundle}"
+          fi
+          hdiutil verify "${dmg}"
+          if [ "${MACOS_SIGNING_MODE}" = "developer-id" ]; then
+            xcrun stapler validate "${dmg}"
+            spctl -a -vvv -t open --context context:primary-signature "${dmg}"
+          fi
+
+          mount_root="$(mktemp -d)"
+          mount_point=""
+          cleanup() {
+            if [ -n "${mount_point}" ]; then
+              hdiutil detach "${mount_point}" || true
+            fi
+            rm -rf "${mount_root}"
+          }
+          trap cleanup EXIT
+
+          attach_output="$(hdiutil attach -nobrowse -readonly -mountroot "${mount_root}" "${dmg}")"
+          echo "${attach_output}"
+          mount_point="$(echo "${attach_output}" | awk 'END { print $NF }')"
+          mounted_app="${mount_point}/socai.app"
+
+          codesign --verify --deep --strict --verbose=2 "${mounted_app}"
+          if [ "${MACOS_SIGNING_MODE}" = "developer-id" ]; then
+            spctl -a -vvv -t execute "${mounted_app}"
+            xcrun stapler validate "${mounted_app}"
+          fi
+
+          executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "${mounted_app}/Contents/Info.plist")"
+          binary="${mounted_app}/Contents/MacOS/${executable}"
+          actual_archs="$(lipo -archs "${binary}")"
+          echo "${binary} architectures: ${actual_archs}"
+
+          for expected_arch in arm64 x86_64; do
+            if [[ " ${actual_archs} " != *" ${expected_arch} "* ]]; then
+              echo "expected ${binary} to include ${expected_arch}, got: ${actual_archs}" >&2
+              exit 1
+            fi
+          done
+
+      - name: collect distributable artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          bundle_dir="target/${TARGET}/release/bundle"
+          dmg_dir="${bundle_dir}/dmg"
+          mkdir -p dist-artifacts
+
+          dmg="$(find "${dmg_dir}" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+
+          if [ -z "${dmg}" ]; then
+            echo "no dmg found in ${dmg_dir}" >&2
+            exit 1
+          fi
+
+          cp "${dmg}" "dist-artifacts/socai-macos-universal.dmg"
+          ls -lah dist-artifacts
+
+      - name: build and sign updater artifact
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [ "${MACOS_SIGNING_MODE}" != "developer-id" ] || [ "${TAURI_UPDATER_SIGNING:-disabled}" != "enabled" ]; then
+            echo "skipping updater artifact (mode=${MACOS_SIGNING_MODE:-unset}, signing=${TAURI_UPDATER_SIGNING:-disabled})"
+            exit 0
+          fi
+
+          bundle_dir="target/${TARGET}/release/bundle"
+          mkdir -p dist-artifacts
+
+          # Tar the notarized + stapled .app into the updater bundle the plugin expects.
+          tarball="dist-artifacts/socai-macos-universal.app.tar.gz"
+          tar -C "${bundle_dir}/macos" -czf "${tarball}" socai.app
+
+          (cd app && pnpm exec tauri signer sign \
+            --private-key "${TAURI_SIGNING_PRIVATE_KEY}" \
+            --password "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD}" \
+            "${GITHUB_WORKSPACE}/${tarball}")
+
+          if [ ! -f "${tarball}.sig" ]; then
+            echo "expected ${tarball}.sig from tauri signer sign" >&2
+            exit 1
+          fi
+
+          # latest.json: the universal bundle serves both arches, so both darwin
+          # keys point at the same tarball (pinned to this release's tag).
+          signature="$(cat "${tarball}.sig")"
+          pub_date="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          download_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/socai-macos-universal.app.tar.gz"
+
+          python3 - "${VERSION}" "${pub_date}" "${download_url}" "${signature}" > dist-artifacts/latest.json <<'PY'
+          import json
+          import sys
+
+          version, pub_date, url, signature = sys.argv[1:5]
+          platform = {"signature": signature, "url": url}
+          print(json.dumps({
+              "version": version,
+              "notes": "See the release notes on GitHub.",
+              "pub_date": pub_date,
+              "platforms": {
+                  "darwin-aarch64": platform,
+                  "darwin-x86_64": platform,
+              },
+          }, indent=2))
+          PY
+
+          echo "generated dist-artifacts/latest.json:"
+          cat dist-artifacts/latest.json
+          ls -lah dist-artifacts
+
+      - name: upload build artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: socai-${{ needs.prepare.outputs.version }}-macos-app
+          path: dist-artifacts/*
+          if-no-files-found: error
+
+  build-windows-cli:
+    name: build windows CLI
+    needs: prepare
+    runs-on: windows-latest
+
+    steps:
+      - name: checkout release base commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.base_sha }}
+
+      - name: apply release version
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python .github/scripts/set-app-version.py $env:VERSION
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.toml app/package.json app/src-tauri/tauri.conf.json app/src-tauri/Cargo.toml Cargo.lock
+          git commit -m "chore: release socai v$env:VERSION"
+          $versionedSha = git rev-parse HEAD
+          "SOCAI_BUILD_SHA=$versionedSha" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "versioned build tree $versionedSha"
+
+      - name: set up rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cache rust build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+          key: windows-x86_64
+
+      - name: build CLI
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SOCAI_PRO_BASE_URL: ${{ secrets.SOCAI_PRO_BASE_URL }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node scripts/prepare-sherpa-onnx-libs.mjs x86_64-pc-windows-msvc
+          $env:SHERPA_ONNX_ARCHIVE_DIR = Join-Path $PWD 'target/sherpa-onnx-archives'
+          cargo build -p socai-cli -p socai-asr --release
+          $versionOutput = & .\target\release\socai.exe --version
+          $versionOutput
+          if ($versionOutput -ne "socai $env:VERSION") {
+            throw "expected CLI version 'socai $env:VERSION', got: $versionOutput"
+          }
+
+      - name: smoke daemon start and stop
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $socaiHome = Join-Path $env:RUNNER_TEMP 'socai-daemon-home'
+          Remove-Item -Recurse -Force $socaiHome -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $socaiHome | Out-Null
+          $stdout = Join-Path $socaiHome 'daemon.stdout.log'
+          $stderr = Join-Path $socaiHome 'daemon.stderr.log'
+          $env:SOCAI_HOME = $socaiHome
+          $daemon = Start-Process -FilePath .\target\release\socai.exe -ArgumentList '__daemon' -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+          try {
+            $endpoint = Join-Path $socaiHome 'rust-daemon-endpoint.json'
+            $ready = $false
+            for ($i = 0; $i -lt 120; $i++) {
+              if (Test-Path $endpoint) {
+                $ready = $true
+                break
+              }
+              Start-Sleep -Milliseconds 250
+            }
+            if (-not $ready) {
+              Get-Content $stderr -ErrorAction SilentlyContinue
+              throw 'daemon endpoint was not created'
+            }
+            & .\target\release\socai.exe stop
+            if (-not $daemon.WaitForExit(30000)) {
+              Stop-Process -Id $daemon.Id -Force
+              throw 'daemon did not exit after stop'
+            }
+            if ($daemon.ExitCode -ne 0) {
+              Get-Content $stderr -ErrorAction SilentlyContinue
+              throw "daemon exited with status $($daemon.ExitCode)"
+            }
+          } finally {
+            Remove-Item Env:SOCAI_HOME -ErrorAction SilentlyContinue
+            if (-not $daemon.HasExited) {
+              Stop-Process -Id $daemon.Id -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+      - name: collect distributable artifacts
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $buildSha = $env:SOCAI_BUILD_SHA
+          if (-not $buildSha) { throw 'SOCAI_BUILD_SHA not set by apply release version step' }
+          $dist = 'dist-artifacts'
+          $packageDir = Join-Path $env:RUNNER_TEMP 'socai-cli-windows-package'
+          Remove-Item -Recurse -Force $dist, $packageDir -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $dist, $packageDir | Out-Null
+          Copy-Item .\target\release\socai.exe (Join-Path $packageDir 'socai.exe')
+          Copy-Item .\target\release\socai-asr.exe (Join-Path $packageDir 'socai-asr.exe')
+          $createdAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+          [ordered]@{
+            base_sha = $env:BASE_SHA
+            created_at = $createdAt
+            git_sha = $buildSha
+            target = 'windows-x86_64'
+            version = $env:VERSION
+          } | ConvertTo-Json | Set-Content -Encoding utf8NoBOM (Join-Path $packageDir 'manifest.json')
+
+          $archive = Join-Path $dist 'socai-cli-windows-x86_64.zip'
+          Compress-Archive -Path (Join-Path $packageDir 'socai.exe'), (Join-Path $packageDir 'socai-asr.exe'), (Join-Path $packageDir 'manifest.json') -DestinationPath $archive
+          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          $checksumPath = "$archive.sha256"
+          [System.IO.File]::WriteAllText($checksumPath, "$hash  socai-cli-windows-x86_64.zip`n", [System.Text.Encoding]::ASCII)
+          if ([System.IO.File]::ReadAllText($checksumPath).Contains("`r")) {
+            throw 'Windows checksum file must use LF line endings'
+          }
+          Copy-Item scripts\install-cli.ps1 (Join-Path $dist 'install.ps1')
+
+          $verifyDir = Join-Path $env:RUNNER_TEMP 'socai-cli-windows-verify'
+          Remove-Item -Recurse -Force $verifyDir -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $verifyDir | Out-Null
+          Expand-Archive -Path $archive -DestinationPath $verifyDir
+          $versionOutput = & (Join-Path $verifyDir 'socai.exe') --version
+          if ($versionOutput -ne "socai $env:VERSION") {
+            throw "expected archive CLI version 'socai $env:VERSION', got: $versionOutput"
+          }
+          if (-not (Test-Path (Join-Path $verifyDir 'socai-asr.exe'))) {
+            throw 'archive missing socai-asr.exe'
+          }
+          $manifest = Get-Content -Raw (Join-Path $verifyDir 'manifest.json') | ConvertFrom-Json
+          if ($manifest.version -ne $env:VERSION) { throw 'manifest version mismatch' }
+          if ($manifest.target -ne 'windows-x86_64') { throw 'manifest target mismatch' }
+          if ($manifest.git_sha -ne $buildSha) { throw 'manifest git_sha mismatch' }
+          if ($manifest.base_sha -ne $env:BASE_SHA) { throw 'manifest base_sha mismatch' }
+          if (-not $manifest.created_at) { throw 'manifest missing created_at' }
+          Get-ChildItem $dist
+
+      - name: upload build artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: socai-${{ needs.prepare.outputs.version }}-windows-cli
+          path: dist-artifacts/*
+          if-no-files-found: error
+
+  build-windows-app:
+    name: build windows app installer
+    needs: prepare
+    runs-on: windows-latest
+
+    steps:
+      - name: checkout release base commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.base_sha }}
+
+      - name: apply release version
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python .github/scripts/set-app-version.py $env:VERSION
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.toml app/package.json app/src-tauri/tauri.conf.json app/src-tauri/Cargo.toml Cargo.lock
+          git commit -m "chore: release socai v$env:VERSION"
+          $versionedSha = git rev-parse HEAD
+          "SOCAI_BUILD_SHA=$versionedSha" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "versioned build tree $versionedSha"
+
+      - name: set up pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 10.28.2
+          run_install: false
+
+      - name: set up node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+
+      - name: install frontend dependencies
+        working-directory: app
+        run: pnpm install --frozen-lockfile
+
+      - name: set up rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cache rust build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+          key: windows-app
+
+      - name: clear stale bundle outputs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Remove-Item -Recurse -Force target\release\bundle -ErrorAction SilentlyContinue
+
+      - name: build app installer
+        working-directory: app
+        shell: pwsh
+        env:
+          SOCAI_PRO_BASE_URL: ${{ secrets.SOCAI_PRO_BASE_URL }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # NSIS only (the user-selected installer). Authenticode code signing is
+          # intentionally not configured yet, so the installer ships unsigned and
+          # SmartScreen will warn — updater signing below is independent of this.
+          pnpm exec tauri build --ci --bundles nsis
+
+      - name: collect and sign updater artifact
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $bundleDir = 'target\release\bundle\nsis'
+          $dist = 'dist-artifacts'
+          Remove-Item -Recurse -Force $dist -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+
+          $installer = Get-ChildItem -Path $bundleDir -Filter '*-setup.exe' -File | Select-Object -First 1
+          if (-not $installer) { throw "no NSIS installer found in $bundleDir" }
+          if ($installer.Name -notlike "*$env:VERSION*") {
+            throw "expected installer name to contain version $env:VERSION, got: $($installer.Name)"
+          }
+          $assetRel = Join-Path $dist 'socai-windows-x86_64-setup.exe'
+          $assetFull = Join-Path $env:GITHUB_WORKSPACE $assetRel
+          Copy-Item $installer.FullName $assetFull
+          "collected $($installer.Name) -> $assetRel"
+
+          # Desktop auto-updater signing (minisign) — independent of Authenticode.
+          # The updater verifies each release against the pubkey baked into
+          # tauri.conf.json, so the matching private key must sign the installer.
+          if ($env:TAURI_SIGNING_PRIVATE_KEY -and $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) {
+            Push-Location app
+            try {
+              # The CLI reads the key and password from the TAURI_SIGNING_* env
+              # vars already set on this step, so the multi-line minisign key
+              # never crosses the pwsh -> pnpm -> node command-line round-trip.
+              pnpm exec tauri signer sign "$assetFull"
+              if ($LASTEXITCODE -ne 0) { throw "tauri signer sign exited with status $LASTEXITCODE" }
+            } finally {
+              Pop-Location
+            }
+            $sigFull = "$assetFull.sig"
+            if (-not (Test-Path $sigFull)) { throw "expected $sigFull from tauri signer sign" }
+            $signature = (Get-Content -Raw $sigFull).Trim()
+            $downloadUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/v$($env:VERSION)/socai-windows-x86_64-setup.exe"
+            # Partial updater manifest merged into latest.json by the publish job,
+            # so the macOS-produced darwin keys are not clobbered.
+            [ordered]@{
+              'windows-x86_64' = [ordered]@{ signature = $signature; url = $downloadUrl }
+            } | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8NoBOM (Join-Path $dist 'latest-windows-x86_64.json')
+            "generated windows updater fragment:"
+            Get-Content (Join-Path $dist 'latest-windows-x86_64.json')
+          } elseif ($env:GITHUB_REF -eq 'refs/heads/main') {
+            throw 'main releases require TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD secrets for the desktop auto-updater'
+          } else {
+            "no updater signing key for this branch build; skipping installer signature and updater fragment"
+          }
+
+          Get-ChildItem $dist
+
+      - name: upload build artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: socai-${{ needs.prepare.outputs.version }}-windows-app
+          path: dist-artifacts/*
+          if-no-files-found: error
+
+  release:
+    name: publish github release
+    if: github.ref == 'refs/heads/main'
+    needs:
+      - prepare
+      - build-macos-app-dmg
+      - build-macos-cli
+      - build-windows-cli
+      - build-windows-app
+    runs-on: ubuntu-latest
+    env:
+      SOCAI_OSS_BUCKET: ${{ vars.SOCAI_OSS_BUCKET }}
+      SOCAI_OSS_ENDPOINT: ${{ vars.SOCAI_OSS_ENDPOINT }}
+      SOCAI_OSS_PREFIX: ${{ vars.SOCAI_OSS_PREFIX }}
+      SOCAI_OSS_PUBLIC_BASE_URL: ${{ vars.SOCAI_OSS_PUBLIC_BASE_URL }}
+
+    steps:
+      - name: checkout main
+        uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: download build artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: socai-${{ needs.prepare.outputs.version }}-*
+          merge-multiple: true
+          path: dist-artifacts
+
+      - name: merge windows entry into updater manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # The macOS app job produces latest.json with only the darwin-* keys;
+          # the windows app job produces a windows-x86_64 fragment. Merge the
+          # fragment into the canonical manifest here (rather than letting two
+          # latest.json files collide under merge-multiple), then drop the
+          # fragment so it is not published as a release asset.
+          manifest="dist-artifacts/latest.json"
+          fragment="dist-artifacts/latest-windows-x86_64.json"
+
+          if [ ! -f "${manifest}" ]; then
+            echo "missing ${manifest} (expected from the macOS app job)" >&2
+            exit 1
+          fi
+          if [ ! -f "${fragment}" ]; then
+            echo "missing ${fragment} (expected from the windows app job)" >&2
+            exit 1
+          fi
+
+          python3 - "${manifest}" "${fragment}" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          manifest_path, fragment_path = sys.argv[1], sys.argv[2]
+          manifest = json.loads(Path(manifest_path).read_text())
+          fragment = json.loads(Path(fragment_path).read_text())
+          manifest.setdefault("platforms", {}).update(fragment)
+          Path(manifest_path).write_text(json.dumps(manifest, indent=2) + "\n")
+          PY
+
+          rm -f "${fragment}"
+
+          echo "merged latest.json:"
+          cat "${manifest}"
+
+      - name: install OSS release publisher dependencies
+        run: python3 -m pip install --disable-pip-version-check --quiet oss2==2.19.1
+
+      - name: stage versioned release on Alibaba Cloud OSS
+        env:
+          ALIYUN_ACCESS_KEY_ID: ${{ secrets.ALIYUN_ACCESS_KEY_ID }}
+          ALIYUN_ACCESS_KEY_SECRET: ${{ secrets.ALIYUN_ACCESS_KEY_SECRET }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/publish-oss-release.py stage \
+            --source-dir dist-artifacts \
+            --bucket "${SOCAI_OSS_BUCKET}" \
+            --endpoint "${SOCAI_OSS_ENDPOINT}" \
+            --tag "${TAG}" \
+            --prefix "${SOCAI_OSS_PREFIX}" \
+            --public-base-url "${SOCAI_OSS_PUBLIC_BASE_URL}"
+
+      - name: publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PREVIOUS_TAG: ${{ needs.prepare.outputs.previous_tag }}
+          BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+
+          current_main_sha="$(git rev-parse HEAD)"
+          if [ "${current_main_sha}" != "${BASE_SHA}" ]; then
+            echo "main moved while the release was building" >&2
+            echo "expected ${BASE_SHA}, got ${current_main_sha}" >&2
+            echo "rerun the release workflow from the latest main" >&2
+            exit 1
+          fi
+
+          required_artifacts=(
+            dist-artifacts/socai-macos-universal.dmg
+            dist-artifacts/socai-macos-universal.app.tar.gz
+            dist-artifacts/socai-macos-universal.app.tar.gz.sig
+            dist-artifacts/latest.json
+            dist-artifacts/socai-cli-macos-universal.tar.gz
+            dist-artifacts/socai-cli-macos-universal.tar.gz.sha256
+            dist-artifacts/install.sh
+            dist-artifacts/socai-cli-windows-x86_64.zip
+            dist-artifacts/socai-cli-windows-x86_64.zip.sha256
+            dist-artifacts/install.ps1
+            dist-artifacts/socai-windows-x86_64-setup.exe
+            dist-artifacts/socai-windows-x86_64-setup.exe.sig
+          )
+          for artifact in "${required_artifacts[@]}"; do
+            if [ ! -f "${artifact}" ]; then
+              echo "missing release artifact: ${artifact}" >&2
+              exit 1
+            fi
+          done
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          python3 .github/scripts/set-app-version.py "${VERSION}"
+
+          git add Cargo.toml app/package.json app/src-tauri/tauri.conf.json app/src-tauri/Cargo.toml Cargo.lock
+          if git diff --cached --quiet; then
+            echo "version files already up to date"
+          else
+            git commit -m "chore: release socai v${VERSION}"
+          fi
+
+          release_sha="$(git rev-parse HEAD)"
+          main_pushed=false
+          remote_tag_pushed=false
+          draft_release_created=false
+
+          cleanup() {
+            if [ "${main_pushed}" = "true" ]; then
+              echo "main was already updated; leaving release state for manual inspection" >&2
+              return
+            fi
+
+            if [ "${draft_release_created}" = "true" ]; then
+              gh release delete "${TAG}" --repo "${GITHUB_REPOSITORY}" --cleanup-tag --yes || true
+            elif [ "${remote_tag_pushed}" = "true" ]; then
+              git push origin ":refs/tags/${TAG}" || true
+            fi
+          }
+          trap cleanup ERR
+
+          args=(-f "tag_name=${TAG}" -f "target_commitish=${BASE_SHA}")
+          if [ -n "${PREVIOUS_TAG}" ]; then
+            args+=(-f "previous_tag_name=${PREVIOUS_TAG}")
+          fi
+
+          gh api "repos/${GITHUB_REPOSITORY}/releases/generate-notes" "${args[@]}" --jq '.body' > generated-notes.md
+
+          cat > release-notes.md <<EOF
+          ## downloads
+
+          China mirror:
+
+          - [universal mac dmg](${SOCAI_OSS_PUBLIC_BASE_URL}/${TAG}/socai-macos-universal.dmg)
+          - [windows app installer (.exe)](${SOCAI_OSS_PUBLIC_BASE_URL}/${TAG}/socai-windows-x86_64-setup.exe)
+          - [macOS CLI installer](${SOCAI_OSS_PUBLIC_BASE_URL}/${TAG}/install.sh)
+          - [Windows CLI installer](${SOCAI_OSS_PUBLIC_BASE_URL}/${TAG}/install.ps1)
+
+          GitHub archive:
+
+          - [universal mac dmg](https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/socai-macos-universal.dmg) — supports Apple Silicon and Intel Macs.
+          - [windows app installer (.exe)](https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/socai-windows-x86_64-setup.exe) — desktop app for Windows 10/11 (x64).
+          - [macOS CLI installer](https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/install.sh) — one-command macOS CLI install.
+          - [universal mac CLI tarball](https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/socai-cli-macos-universal.tar.gz) — standalone \`socai\` CLI.
+          - [macOS CLI checksum](https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/socai-cli-macos-universal.tar.gz.sha256)
+          - [Windows CLI installer](https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/install.ps1) — one-command Windows CLI install.
+          - [Windows CLI zip](https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/socai-cli-windows-x86_64.zip) — standalone \`socai.exe\` CLI.
+          - [Windows CLI checksum](https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/socai-cli-windows-x86_64.zip.sha256)
+
+          The macOS app build is signed and notarized. The Windows app installer is not yet code-signed, so SmartScreen may warn on first run — choose "More info" then "Run anyway".
+
+          ## changes
+
+          EOF
+          cat generated-notes.md >> release-notes.md
+
+          git tag "${TAG}" "${release_sha}"
+          git push origin "refs/tags/${TAG}"
+          remote_tag_pushed=true
+
+          gh release create "${TAG}" dist-artifacts/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --draft \
+            --title "socai ${VERSION}" \
+            --notes-file release-notes.md
+          draft_release_created=true
+
+          git push origin HEAD:main
+          main_pushed=true
+
+          gh release edit "${TAG}" --repo "${GITHUB_REPOSITORY}" --draft=false
+
+          trap - ERR
+          cat release-notes.md
+
+      - name: promote OSS latest release
+        env:
+          ALIYUN_ACCESS_KEY_ID: ${{ secrets.ALIYUN_ACCESS_KEY_ID }}
+          ALIYUN_ACCESS_KEY_SECRET: ${{ secrets.ALIYUN_ACCESS_KEY_SECRET }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/publish-oss-release.py promote \
+            --source-dir dist-artifacts \
+            --bucket "${SOCAI_OSS_BUCKET}" \
+            --endpoint "${SOCAI_OSS_ENDPOINT}" \
+            --tag "${TAG}" \
+            --prefix "${SOCAI_OSS_PREFIX}" \
+            --public-base-url "${SOCAI_OSS_PUBLIC_BASE_URL}"
+
+  verify-cli-installer:
+    name: verify latest CLI installer
+    if: github.ref == 'refs/heads/main'
+    needs:
+      - prepare
+      - release
+    runs-on: macos-14
+
+    steps:
+      - name: install CLI from latest release
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          install_url="https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/install.sh"
+          test_home="${RUNNER_TEMP}/socai-install-home"
+          install_dir="${RUNNER_TEMP}/socai-bin"
+          rm -rf "${test_home}" "${install_dir}"
+          mkdir -p "${test_home}"
+
+          installed=false
+          for attempt in {1..12}; do
+            echo "install attempt ${attempt}: ${install_url}"
+            if curl -fsSL "${install_url}" | HOME="${test_home}" SOCAI_INSTALL_DIR="${install_dir}" SHELL=/bin/zsh sh; then
+              installed=true
+              break
+            fi
+            sleep 10
+          done
+
+          if [ "${installed}" != "true" ]; then
+            echo "failed to install socai from latest release" >&2
+            exit 1
+          fi
+
+          version_output="$("${install_dir}/socai" --version)"
+          echo "${version_output}"
+          if [ "${version_output}" != "socai ${VERSION}" ]; then
+            echo "expected CLI version 'socai ${VERSION}', got: ${version_output}" >&2
+            exit 1
+          fi
+
+          "${install_dir}/socai" --help >/dev/null
+          grep -F "${install_dir}" "${test_home}/.zshrc"
+
+  verify-windows-cli-installer:
+    name: verify latest Windows CLI installer
+    if: github.ref == 'refs/heads/main'
+    needs:
+      - prepare
+      - release
+    runs-on: windows-latest
+
+    steps:
+      - name: install CLI from latest release
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download/install.ps1"
+          $installDir = Join-Path $env:RUNNER_TEMP 'socai-bin'
+          $installer = Join-Path $env:RUNNER_TEMP 'socai-install.ps1'
+          Remove-Item -Recurse -Force $installDir -ErrorAction SilentlyContinue
+          Remove-Item -Force $installer -ErrorAction SilentlyContinue
+          $env:SOCAI_INSTALL_DIR = $installDir
+
+          $installed = $false
+          for ($attempt = 1; $attempt -le 12; $attempt++) {
+            Write-Host "install attempt ${attempt}: $installUrl"
+            try {
+              Invoke-WebRequest -UseBasicParsing -Uri $installUrl -OutFile $installer
+              Unblock-File $installer
+              & $installer
+              $installed = $true
+              break
+            } catch {
+              Write-Warning $_
+              Start-Sleep -Seconds 10
+            }
+          }
+          if (-not $installed) {
+            throw 'failed to install socai from latest Windows release'
+          }
+
+          $socai = Join-Path $installDir 'socai.exe'
+          $versionOutput = & $socai --version
+          $versionOutput
+          if ($versionOutput -ne "socai $env:VERSION") {
+            throw "expected CLI version 'socai $env:VERSION', got: $versionOutput"
+          }
+          & $socai --help | Out-Null
+          & $socai version --no-check
+
+  verify-windows-desktop-installer:
+    name: verify latest windows desktop installer
+    if: github.ref == 'refs/heads/main'
+    needs:
+      - prepare
+      - release
+    runs-on: windows-latest
+
+    steps:
+      - name: install desktop app from latest release
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setupUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download/socai-windows-x86_64-setup.exe"
+          $setup = Join-Path $env:RUNNER_TEMP 'socai-setup.exe'
+          Remove-Item -Force $setup -ErrorAction SilentlyContinue
+
+          $downloaded = $false
+          for ($attempt = 1; $attempt -le 12; $attempt++) {
+            Write-Host "download attempt ${attempt}: $setupUrl"
+            try {
+              Invoke-WebRequest -UseBasicParsing -Uri $setupUrl -OutFile $setup
+              $downloaded = $true
+              break
+            } catch {
+              Write-Warning $_
+              Start-Sleep -Seconds 10
+            }
+          }
+          if (-not $downloaded) {
+            throw 'failed to download socai desktop installer from latest release'
+          }
+
+          Unblock-File $setup
+          $install = Start-Process -FilePath $setup -ArgumentList '/S' -PassThru -Wait
+          if ($install.ExitCode -ne 0) {
+            throw "silent install exited with status $($install.ExitCode)"
+          }
+
+          # The Tauri main binary keeps its crate name (socai_app.exe). NSIS
+          # installMode currentUser installs under LOCALAPPDATA; search
+          # Program Files too in case the install mode ever changes.
+          $roots = @($env:LOCALAPPDATA, $env:ProgramFiles) | Where-Object { $_ }
+          $app = $null
+          foreach ($root in $roots) {
+            $dir = Join-Path $root 'socai'
+            if (-not (Test-Path $dir)) { continue }
+            Write-Host "install dir ${dir}:"
+            Get-ChildItem $dir | Out-Host
+            $app = Get-ChildItem -Path $dir -Recurse -File -Include 'socai_app.exe', 'socai.exe' -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+            if ($app) { break }
+          }
+          if (-not $app) {
+            throw "app binary not found after install; checked $($roots -join ', ') under socai\"
+          }
+
+          $productVersion = $app.VersionInfo.ProductVersion
+          Write-Host "installed $($app.FullName) (ProductVersion=$productVersion)"
+          if ($productVersion -notmatch "^$([regex]::Escape($env:VERSION))") {
+            throw "expected installed app version to start with $env:VERSION, got: $productVersion"
+          }
+
+  verify-desktop-updater:
+    name: verify desktop updater manifest
+    if: github.ref == 'refs/heads/main'
+    needs:
+      - prepare
+      - release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: verify latest.json
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          OSS_MANIFEST_URL: ${{ vars.SOCAI_OSS_PUBLIC_BASE_URL }}/latest/latest.json
+        run: |
+          set -euo pipefail
+
+          github_manifest_url="https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/latest.json"
+          for manifest_url in "${OSS_MANIFEST_URL}" "${github_manifest_url}"; do
+            manifest=""
+            for attempt in {1..12}; do
+              echo "fetch attempt ${attempt}: ${manifest_url}"
+              if manifest="$(curl -fsSL -H 'Cache-Control: no-cache' "${manifest_url}")"; then
+                break
+              fi
+              manifest=""
+              sleep 10
+            done
+
+            if [ -z "${manifest}" ]; then
+              echo "failed to fetch updater manifest ${manifest_url}" >&2
+              exit 1
+            fi
+
+            echo "${manifest}"
+            manifest_version="$(printf '%s' "${manifest}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
+            if [ "${manifest_version}" != "${VERSION}" ]; then
+              echo "latest.json version ${manifest_version} does not match release ${VERSION}" >&2
+              exit 1
+            fi
+
+            for arch in darwin-aarch64 darwin-x86_64 windows-x86_64; do
+              asset_url="$(printf '%s' "${manifest}" | python3 -c "import json,sys; print(json.load(sys.stdin)['platforms']['${arch}']['url'])")"
+              signature="$(printf '%s' "${manifest}" | python3 -c "import json,sys; print(json.load(sys.stdin)['platforms']['${arch}']['signature'])")"
+              if [ -z "${signature}" ]; then
+                echo "latest.json ${arch} signature is empty" >&2
+                exit 1
+              fi
+              echo "checking ${arch} updater asset: ${asset_url}"
+              curl -fsSL -I "${asset_url}" > /dev/null
+            done
+          done

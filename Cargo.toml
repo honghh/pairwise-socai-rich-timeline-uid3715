@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = [
+    "app/src-tauri",
+    "asr",
+    "core",
+    "cli",
+]
+
+[workspace.package]
+version = "0.6.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/socai-io/socai"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+async-tungstenite = { version = "0.27", default-features = false, features = ["tokio-native-tls"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+clap = { version = "4", features = ["derive"] }
+ratatui = "0.28"
+crossterm = "0.28"
+rustyline = "14"
+inquire = "0.7"
+
+thiserror = "2"
+anyhow = "1"
+libc = "0.2"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+socai-core = { path = "core" }
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+
+# Skip debuginfo for dependencies (workspace crates keep full debuginfo).
+# Roughly halves target/ size per worktree; deps are rarely stepped through.
+[profile.dev.package."*"]
+debug = false

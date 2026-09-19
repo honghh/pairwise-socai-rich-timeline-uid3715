@@ -1,0 +1,114 @@
+{
+  "id": "tiktok",
+  "name": "TikTok",
+  "domains": ["tiktok.com", "*.tiktok.com"],
+  "notes": ["knowledge.md"],
+  "browserTools": {
+    "pageState": {
+      "description": "Read the current TikTok page, login, challenge, and hydration state.",
+      "path": "page_scripts.js",
+      "binding": "window.SocaiTikTokPageScripts",
+      "callable": "pageState",
+      "args": {},
+      "returns": { "type": "object", "description": "Current page state." }
+    },
+    "searchState": {
+      "description": "Read the active TikTok search route and result state.",
+      "path": "page_scripts.js",
+      "binding": "window.SocaiTikTokPageScripts",
+      "callable": "searchState",
+      "args": { "query": { "type": "string", "required": false, "description": "Expected search text." } },
+      "returns": { "type": "object", "description": "Search transition and result state." }
+    },
+    "videoCards": {
+      "description": "Collect TikTok video cards across the current lazy result or author grid up to limit.",
+      "path": "page_scripts.js",
+      "binding": "window.SocaiTikTokPageScripts",
+      "callable": "videoCards",
+      "args": {
+        "limit": { "type": "integer", "required": false, "description": "Maximum cards to return." },
+        "author_id": { "type": "string", "required": false, "description": "Optional author handle filter." },
+        "viewport_only": { "type": "boolean", "required": false, "description": "Only include cards in the viewport." }
+      },
+      "returns": { "type": "array", "description": "Visible TikTok video cards." }
+    },
+    "scrollFeed": {
+      "description": "Scroll the current TikTok feed or grid by a bounded amount.",
+      "path": "page_scripts.js",
+      "binding": "window.SocaiTikTokPageScripts",
+      "callable": "scrollFeed",
+      "args": {
+        "nudge_up": { "type": "boolean", "required": false, "description": "Move slightly upward instead of down." },
+        "to_top": { "type": "boolean", "required": false, "description": "Reset the active feed to the top." }
+      },
+      "returns": { "type": "object", "description": "Scroll position and movement." }
+    },
+    "videoState": {
+      "description": "Read hydration and identity state for the active TikTok video.",
+      "path": "page_scripts.js",
+      "binding": "window.SocaiTikTokPageScripts",
+      "callable": "videoState",
+      "args": {},
+      "returns": { "type": "object", "description": "Active video state." }
+    },
+    "videoDetail": {
+      "description": "Extract the active TikTok video metadata and media candidates.",
+      "path": "page_scripts.js",
+      "binding": "window.SocaiTikTokPageScripts",
+      "callable": "videoDetail",
+      "args": {},
+      "returns": { "type": "object", "description": "TikTok video detail." }
+    },
+    "playerPlayButton": {
+      "description": "Locate the visible TikTok player play control.",
+      "path": "page_scripts.js",
+      "binding": "window.SocaiTikTokPageScripts",
+      "callable": "playerPlayButton",
+      "args": {},
+      "returns": { "type": "object", "description": "Player control geometry." }
+    },
+    "commentActivation": {
+      "description": "Locate the TikTok comment panel activation control.",
+      "path": "page_scripts.js",
+      "binding": "window.SocaiTikTokPageScripts",
+      "callable": "commentActivation",
+      "args": {},
+      "returns": { "type": "object", "description": "Comment activation state and geometry." }
+    },
+    "comments": {
+      "description": "Collect TikTok comments and expanded replies across the lazy comment panel up to limit.",
+      "path": "page_scripts.js",
+      "binding": "window.SocaiTikTokPageScripts",
+      "callable": "comments",
+      "args": { "limit": { "type": "integer", "required": false, "description": "Maximum comments to return." } },
+      "returns": { "type": "array", "description": "Accumulated, deduplicated comments." }
+    },
+    "scrollComments": {
+      "description": "Scroll the active TikTok comment panel.",
+      "path": "page_scripts.js",
+      "binding": "window.SocaiTikTokPageScripts",
+      "callable": "scrollComments",
+      "args": {},
+      "returns": { "type": "object", "description": "Comment scroll state." }
+    },
+    "authorState": {
+      "description": "Read hydration and challenge state for the current TikTok author page.",
+      "path": "page_scripts.js",
+      "binding": "window.SocaiTikTokPageScripts",
+      "callable": "authorState",
+      "args": {},
+      "returns": { "type": "object", "description": "Author page state." }
+    },
+    "authorProfile": {
+      "description": "Extract the current TikTok author profile and visible works.",
+      "path": "page_scripts.js",
+      "binding": "window.SocaiTikTokPageScripts",
+      "callable": "authorProfile",
+      "args": {
+        "limit": { "type": "integer", "required": false, "description": "Maximum author videos to return." },
+        "viewport_only": { "type": "boolean", "required": false, "description": "Only include author videos in the viewport." }
+      },
+      "returns": { "type": "object", "description": "TikTok author profile." }
+    }
+  }
+}

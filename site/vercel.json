@@ -1,0 +1,65 @@
+{
+  "ignoreCommand": "git diff --quiet HEAD^ HEAD ./",
+  "functions": {
+    "api/telemetry.js": {
+      "maxDuration": 10
+    },
+    "api/traces.js": {
+      "maxDuration": 10
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/v1/events",
+      "destination": "/api/telemetry"
+    },
+    {
+      "source": "/v1/traces",
+      "destination": "/api/traces"
+    }
+  ],
+  "redirects": [
+    {
+      "source": "/",
+      "has": [
+        {
+          "type": "host",
+          "value": "www.socai.io"
+        }
+      ],
+      "destination": "https://socai.io/",
+      "permanent": true
+    },
+    {
+      "source": "/:path*",
+      "has": [
+        {
+          "type": "host",
+          "value": "www.socai.io"
+        }
+      ],
+      "destination": "https://socai.io/:path*",
+      "permanent": true
+    },
+    {
+      "source": "/download",
+      "destination": "https://socai-download.oss-cn-beijing.aliyuncs.com/releases/latest/socai-macos-universal.dmg",
+      "permanent": false
+    },
+    {
+      "source": "/download/macos",
+      "destination": "https://socai-download.oss-cn-beijing.aliyuncs.com/releases/latest/socai-macos-universal.dmg",
+      "permanent": false
+    },
+    {
+      "source": "/download/windows",
+      "destination": "https://socai-download.oss-cn-beijing.aliyuncs.com/releases/latest/socai-windows-x86_64-setup.exe",
+      "permanent": false
+    },
+    {
+      "source": "/github",
+      "destination": "https://github.com/socai-io/socai",
+      "permanent": false
+    }
+  ]
+}

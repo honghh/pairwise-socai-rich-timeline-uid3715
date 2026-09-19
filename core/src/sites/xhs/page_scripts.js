@@ -1,0 +1,1526 @@
+const SocaiXhsPageScripts = (() => {
+  // ── tiny DOM helpers ─────────────────────────────────────────
+  const $ = (sel, root = document) => (root || document).querySelector(sel);
+  const $$ = (sel, root = document) => Array.from((root || document).querySelectorAll(sel));
+  const text = (el) => (el ? (el.innerText || el.textContent || '').trim() : '');
+  const norm = (s) => String(s || '')
+    .replace(/ /g, ' ')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  const absUrl = (url) => {
+    try { return url ? new URL(url, location.href).href : ''; } catch (e) { return ''; }
+  };
+
+  function elementCenter(el) {
+    const rect = el.getBoundingClientRect();
+    return {
+      x: Math.round(rect.left + rect.width / 2),
+      y: Math.round(rect.top + rect.height / 2),
+    };
+  }
+
+  function isVisible(el) {
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    const style = window.getComputedStyle(el);
+    return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+  }
+
+  // ── note modal scoping (the core fix for content extraction) ─
+  function getNoteOverlay() {
+    // `#noteContainer` is also the root of a directly navigated full-screen
+    // detail page. Only overlay wrappers count as modal state; getNoteRoot()
+    // falls back to the same note container for full-screen extraction.
+    const overlay = $('.note-detail-mask, .note-overlay, .note-detail-modal');
+    return overlay && overlay.offsetHeight > 0 ? overlay : null;
+  }
+
+  function getNoteRoot() {
+    const overlay = getNoteOverlay();
+    if (overlay) return overlay;
+    for (const sel of ['#noteContainer', '.note-detail-mask', '.note-detail-modal', '.note-detail', '.note-scroller', '.note-content']) {
+      const el = $(sel);
+      if (isVisible(el)) return el;
+    }
+    return document;
+  }
+
+  const COMMENT_AREA_SELECTOR =
+    '.comments-container, .comment-list, .comment-item, .comment-inner, .comment-wrapper, ' +
+    '.parent-comment, .reply-item, .sub-comment-item, .child-comment-item, .reply-comment-item, ' +
+    '[class*="comment"]';
+
+  function inCommentArea(el) {
+    return !!el?.closest?.(COMMENT_AREA_SELECTOR);
+  }
+
+  function firstVisibleText(selectors, root, { excludeComments = false } = {}) {
+    for (const sel of selectors) {
+      for (const el of $$(sel, root)) {
+        if (!isVisible(el)) continue;
+        if (excludeComments && inCommentArea(el)) continue;
+        const value = norm(el.innerText || el.textContent || '');
+        if (value) return value;
+      }
+    }
+    return '';
+  }
+
+  // ── search input / state / cards ─────────────────────────────
+  // 2026-05: the homepage search widget switched from <input> to a
+  // <textarea class="textarea"> living inside #search-input-in-feeds
+  // (a chat-style composer with an AI helper "问点点" below). The
+  // legacy <input> selectors are kept as fallback in case XHS rolls
+  // the old UI back to some users.
+  //
+  // 2026-06: the composer placeholder now rotates trending hot-search
+  // phrases (e.g. "世界杯L组7点直播") instead of containing "搜索", so
+  // `placeholder*="搜索"` matches nothing and search silently no-ops.
+  // Anchor on the textarea's stable structural role instead:
+  // `.search-input textarea` works on both the home feed and the
+  // /search_result page; `#search-input-in-feeds textarea` is the
+  // explicit home-feed container. The placeholder match is demoted to
+  // a fallback.
+  const SEARCH_INPUT_SELECTORS = [
+    '.search-input textarea',
+    '#search-input-in-feeds textarea',
+    'textarea[placeholder*="搜索"]',
+    'input#search-input',
+    'input[type="search"]',
+    'input[placeholder*="搜索"]',
+    '.search-input input',
+    '.search-container input',
+  ];
+
+  function findSearchInput() {
+    for (const sel of SEARCH_INPUT_SELECTORS) {
+      for (const el of $$(sel)) {
+        if (!(el instanceof HTMLElement)) continue;
+        // 2026-07: two decoys can outrank the real composer. The header
+        // carries a display:none duplicate (#search-input inside
+        // .ai-header-container) — zero width, already filtered. Browser
+        // extensions also overlay a near-transparent aria-hidden clone
+        // (data-hp-kind, opacity 1e-05) that has full width, so filter
+        // on aria-hidden and computed opacity too.
+        if (el.getAttribute('aria-hidden') === 'true') continue;
+        if (parseFloat(window.getComputedStyle(el).opacity) < 0.1) continue;
+        if (el.getBoundingClientRect().width >= 120) return el;
+      }
+    }
+    return undefined;
+  }
+
+  // Focus the search input and select any existing text, so trusted CDP
+  // per-char typing replaces it wholesale. The 2026-07 home-feed AI
+  // composer ("aiSearchTextarea") ignores synthetic input events:
+  // setSearchInput's native-setter write leaves the framework state empty,
+  // the submit button stays `disabled`, and Enter no-ops — so Rust now
+  // types the query with real CDP key events and keeps setSearchInput only
+  // as a legacy fallback.
+  function selectSearchInput() {
+    const input = findSearchInput();
+    if (!input) return { ok: false, error: 'search_input_not_found' };
+    input.focus();
+    let value = '';
+    if (input instanceof HTMLInputElement || input instanceof HTMLTextAreaElement) {
+      value = String(input.value || '');
+      input.setSelectionRange(0, value.length);
+    } else if (input.isContentEditable) {
+      value = String(input.textContent || '');
+      const range = document.createRange();
+      range.selectNodeContents(input);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+    } else {
+      return { ok: false, error: 'unsupported_search_input' };
+    }
+    return { ok: true, value };
+  }
+
+  function setSearchInput(arg) {
+    const targetValue = String((arg && arg.query) || '');
+    const input = findSearchInput();
+    if (!input) return { ok: false, error: 'search_input_not_found' };
+
+    input.focus();
+    if (input instanceof HTMLInputElement || input instanceof HTMLTextAreaElement) {
+      const proto = input instanceof HTMLTextAreaElement
+        ? HTMLTextAreaElement.prototype
+        : HTMLInputElement.prototype;
+      const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+      if (descriptor && descriptor.set) descriptor.set.call(input, targetValue);
+      else input.value = targetValue;
+    } else if (input.isContentEditable) {
+      input.textContent = targetValue;
+    } else {
+      return { ok: false, error: 'unsupported_search_input' };
+    }
+
+    input.dispatchEvent(new InputEvent('input', {
+      bubbles: true,
+      inputType: 'insertReplacementText',
+      data: targetValue,
+    }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+
+    const actualValue = input instanceof HTMLInputElement || input instanceof HTMLTextAreaElement
+      ? input.value
+      : input.textContent;
+    const trimmed = String(actualValue || '').trim();
+    return {
+      ok: trimmed === targetValue.trim(),
+      value: trimmed,
+    };
+  }
+
+  // Selectors for the search-submit affordance, tried in priority order.
+  // The current single-line composer mounts `.single-line-search-btn` only
+  // after text is entered. Older chat-composer and legacy controls stay as
+  // fallbacks. We don't try to score arbitrary clickable elements anymore.
+  const SEARCH_SUBMIT_SELECTORS = [
+    '.single-line-search-btn',
+    '.bottom-box-right-submit-button',
+    '.submit-button-wrapper',
+    'button[type="submit"]',
+    '.search-icon',
+    '.search-btn',
+    '.icon-search',
+  ];
+
+  function searchInput() {
+    const input = findSearchInput();
+    if (!input) return { ok: false, error: 'search_input_not_found' };
+    const root = input.closest(
+      'form, header, .textarea-container, .search-input, .search-container, .search-bar, .search-box, .wendian-wrapper'
+    ) || document;
+
+    let submit = null;
+    for (const sel of SEARCH_SUBMIT_SELECTORS) {
+      const el = root.querySelector(sel) || document.querySelector(sel);
+      if (!el) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width < 12 || r.height < 12) continue;
+      submit = elementCenter(el);
+      break;
+    }
+
+    return {
+      ok: true,
+      input: elementCenter(input),
+      submit,
+    };
+  }
+
+  function searchState() {
+    const cards = $$('section.note-item, [data-note-id], .feeds-page .note-item');
+    const input = findSearchInput();
+    const url = new URL(location.href);
+    const bodyText = text(document.body);
+    const loading = $$('.loading, .spinner, [class*="loading"]').some((el) => isVisible(el));
+    const hasNoResults = /暂无|没有找到|无结果|换个词试试|no result/i.test(bodyText);
+    // Do not scan ordinary note/card text for blocker phrases: searches about
+    // captcha or rate-limit topics are legitimate. Prefer visible blocker UI;
+    // use the full page only when the normal search surface is absent.
+    const blockerUiText = $$([
+      '[class*="captcha" i]', '[class*="verify" i]', '[class*="verification" i]',
+      '[class*="security" i]', '[class*="risk" i]', '[class*="limit" i]',
+      '[class*="exception" i]', '[class*="error-page" i]',
+    ].join(', ')).filter(isVisible).map(text).join(' ');
+    const fallbackBlockerText = !input && cards.length === 0
+      ? `${document.title || ''} ${bodyText}`
+      : '';
+    const blockerText = `${location.href} ${blockerUiText} ${fallbackBlockerText}`;
+    const rateLimited = /300013|访问过于频繁|访问频繁|请求过于频繁|too many requests|rate[ -]?limit/i.test(blockerText);
+    const securityVerification = /安全验证|风险验证|异常访问|unusual traffic|security verification|captcha/i.test(blockerText);
+    // Exactly the classic results list. `includes('/search_result')` would
+    // also match `/search_result_ai` — the AI-search page some submits get
+    // hijacked onto (its ranking differs and the filter panel is missing) —
+    // and `/search_result/<id>` detail routes.
+    const isResultsList = url.pathname.replace(/\/+$/, '') === '/search_result';
+    return {
+      ok: true,
+      page_state: isResultsList ? 'search_results' : 'unknown',
+      url: location.href,
+      url_keyword: url.searchParams.get('keyword') || '',
+      input_keyword: input ? String(input.value || input.textContent || '').trim() : '',
+      card_count: cards.length,
+      loading,
+      has_no_results: hasNoResults,
+      login_required: loginWallVisible(),
+      rate_limited: rateLimited,
+      security_verification: securityVerification,
+    };
+  }
+
+  // ── login state ──────────────────────────────────────────────
+  // The logged-out wall: XHS's .reds-modal.login-modal / .login-container (QR +
+  // phone-login form). Structural classes verified against snapshot DOM (not
+  // hashed build classes); text fallback catches an unanticipated variant. This
+  // is the single wall primitive — loginState() and the pageState/searchState
+  // login_required flags all read it.
+  function loginWallVisible() {
+    if ($$('.login-container, .reds-modal.login-modal, .login-modal').some(isVisible)) {
+      return true;
+    }
+    return $$('[class*="login"]').some(
+      (el) => isVisible(el) && /手机号登录|扫码登录|获取验证码/.test(text(el)),
+    );
+  }
+
+  // Tri-state login read for the pre-flight gate, keyed off the persistent left
+  // sidebar so a dismissed QR modal isn't misread: the "登录" button
+  // (.side-bar-component.login-btn) shows only logged out and survives closing
+  // the modal; the "我" entry (.user.side-bar-component) replaces it once logged
+  // in. 'unknown' = sidebar not rendered yet, so the gate keeps polling.
+  function loginState() {
+    if (loginWallVisible() || $$('.side-bar-component.login-btn').some(isVisible)) {
+      return { ok: true, login: 'out' };
+    }
+    if ($$('.user.side-bar-component').some(isVisible)) {
+      return { ok: true, login: 'in' };
+    }
+    return { ok: true, login: 'unknown' };
+  }
+
+  function pageState() {
+    const url = location.href;
+    let state = 'unknown';
+    if (/xiaohongshu\.com\/user\/profile\//.test(url)) state = 'profile_page';
+    else if (/\/(?:explore|discovery|search_result)\/[^/?#]+/.test(url) || getNoteOverlay()) state = 'note_detail';
+    else if (url.includes('/search_result')) state = 'search_results';
+    else if (/xiaohongshu\.com/.test(url)) state = 'homepage';
+    return {
+      ok: true,
+      state,
+      url,
+      title: document.title,
+      note_open: noteOpen(),
+      search: searchState(),
+      login_required: loginWallVisible(),
+    };
+  }
+
+  function searchCards() {
+    const fromState = [];
+    try {
+      const feeds = window.__INITIAL_STATE__?.search?.feeds?._value || [];
+      for (let i = 0; i < feeds.length; i++) {
+        const item = feeds[i] || {};
+        const card = item.noteCard || item.note_card || null;
+        if (!card) continue;
+        const id = item.id || card.id || card.noteId || '';
+        const token = item.xsecToken || item.xsec_token || '';
+        fromState.push({
+          note_id: id,
+          title: card.displayTitle || card.title || '',
+          author: card.user?.nickname || card.user?.nickName || '',
+          author_id: card.user?.userId || card.user?.id || '',
+          author_url: card.user?.userId ? `https://www.xiaohongshu.com/user/profile/${card.user.userId}` : '',
+          likes: String(card.interactInfo?.likedCount || card.interactInfo?.likes || ''),
+          cover_url: cleanImageUrl(card.cover?.urlDefault || card.cover?.urlPre || ''),
+          // XHS's raw type is "normal" for image/text notes; map it to "image"
+          // so cards share the note vocabulary ("image"/"video").
+          type: card.type === 'normal' ? 'image' : (card.type || ''),
+          position: i,
+          xsec_token: token,
+          link: id && token
+            ? `https://www.xiaohongshu.com/explore/${id}?xsec_token=${encodeURIComponent(token)}&xsec_source=pc_search`
+            : (id ? `https://www.xiaohongshu.com/explore/${id}` : ''),
+        });
+      }
+    } catch (e) {}
+    if (fromState.length) return fromState;
+
+    const cards = $$('section.note-item, [data-note-id], .feeds-page .note-item');
+    return cards.map((card, i) => {
+      const linkEl = card.querySelector('a[href*="/explore/"], a[href*="/search_result/"]') || card.closest('a') || card.querySelector('a');
+      const bareLink = linkEl ? linkEl.href : '';
+      const idMatch = bareLink.match(/\/(?:explore|search_result|discovery)\/([^/?#]+)/);
+      const noteId = card.dataset?.noteId || (idMatch ? idMatch[1] : '');
+      // Profile cards render a hidden bare /explore/<id> link plus visible
+      // cover/title links shaped /user/profile/<author>/<note>?xsec_token=… .
+      // The token belongs to the note even though that route looks like a
+      // profile URL. Resolve it from the href that contains this card's id,
+      // then expose a canonical tokenized /explore URL for get_notes handoff.
+      const tokenLink = $$('a[href*="xsec_token="]', card).find((anchor) => {
+        try {
+          const url = new URL(anchor.href || anchor.getAttribute('href'), location.href);
+          return !!url.searchParams.get('xsec_token') && (!noteId || url.pathname.includes(noteId));
+        } catch (e) { return false; }
+      });
+      let xsecToken = '';
+      if (tokenLink) {
+        try { xsecToken = new URL(tokenLink.href, location.href).searchParams.get('xsec_token') || ''; } catch (e) {}
+      }
+      const link = noteId && xsecToken
+        ? `https://www.xiaohongshu.com/explore/${noteId}?xsec_token=${encodeURIComponent(xsecToken)}&xsec_source=pc_user`
+        : bareLink;
+      const authorEl = card.querySelector('.author-wrapper a[href*="/user/profile/"], a.author[href*="/user/profile/"]');
+      const authorUrl = authorEl ? absUrl(authorEl.href || authorEl.getAttribute('href')) : '';
+      const authorIdMatch = authorUrl.match(/\/user\/profile\/([^/?#]+)/);
+      return {
+        note_id: noteId,
+        title: text(card.querySelector('.title, .note-title, a.title span')),
+        author: text(card.querySelector('.author-wrapper .name, .author .name, .nick-name')),
+        author_id: authorIdMatch ? authorIdMatch[1] : '',
+        author_url: authorUrl,
+        likes: text(card.querySelector('.like-wrapper .count, .engagement .like .count, .count')),
+        cover_url: card.querySelector('.cover img, .note-cover img, img')?.src || '',
+        type: card.querySelector('video, .play-icon, .video-icon, svg[class*="video"], .duration') ? 'video' : 'image',
+        position: i,
+        xsec_token: xsecToken,
+        link,
+      };
+    }).filter((c) => c.note_id || c.title || c.link);
+  }
+
+  // ── search filter popup (hover-triggered 筛选 panel) ─────────
+  // This script only reports the panel as the DOM presents it — each group's
+  // visible title plus its visible tags. The canonical key/option vocabulary
+  // lives Rust-side (XHS_SEARCH_FILTERS); keeping it out of here avoids two
+  // lists drifting apart.
+
+  function findSearchFilterTrigger() {
+    // The 筛选 trigger sits in the results header normally, but when the
+    // 问点点 AI summary panel shows up for a query the layout shifts and the
+    // trigger moves into the AI section (`.filter.ai-chat-filter`). Try the
+    // header first, then progressively broaden so both layouts work; in every
+    // case require a visible, filter-classed element whose text is 筛选.
+    const selectors = [
+      '.search-layout__top > .filter, .search-layout__top [class~="filter"]',
+      '.search-layout [class~="filter"]',
+      '.ai-chat-filter, [class~="filter"]',
+    ];
+    for (const selector of selectors) {
+      for (const el of $$(selector)) {
+        if (!(el instanceof HTMLElement) || !isVisible(el)) continue;
+        if (text(el).includes('筛选')) return el;
+      }
+    }
+    return null;
+  }
+
+  function searchFilterTrigger() {
+    const trigger = findSearchFilterTrigger();
+    if (!trigger) {
+      return { ok: false, error: 'filter_trigger_not_found' };
+    }
+    const value = text(trigger);
+    const label = value.includes('已筛选') ? '已筛选' : '筛选';
+    return { ok: true, label, ...elementCenter(trigger) };
+  }
+
+  function findSearchFilterPanel() {
+    for (const el of $$('.filter-panel, .filter-container')) {
+      if (!(el instanceof HTMLElement) || !isVisible(el)) continue;
+      const value = text(el);
+      if (value.includes('排序依据') && value.includes('发布时间')) {
+        return el;
+      }
+    }
+    return null;
+  }
+
+  function findFilterOperation(panel, label) {
+    for (const el of $$('.operation-container .operation', panel)) {
+      if (!(el instanceof HTMLElement) || !isVisible(el)) continue;
+      if (text(el) === label) return el;
+    }
+    return null;
+  }
+
+  function searchFilters() {
+    const panel = findSearchFilterPanel();
+    if (!panel) return { ok: false, error: 'filter_panel_not_found' };
+
+    const groups = [];
+    for (const groupEl of $$('.filters-wrapper .filters', panel)) {
+      if (!(groupEl instanceof HTMLElement) || !isVisible(groupEl)) continue;
+      const title = text($('span', groupEl));
+      if (!title) continue;
+      const options = [];
+      for (const tag of $$('.tag-container .tags', groupEl)) {
+        if (!(tag instanceof HTMLElement) || !isVisible(tag)) continue;
+        const label = text(tag);
+        if (!label) continue;
+        options.push({
+          label,
+          active: /\bactive\b/.test(String(tag.className || '')),
+          ...elementCenter(tag),
+        });
+      }
+      if (options.length) {
+        groups.push({ title, options });
+      }
+    }
+
+    const resetEl = findFilterOperation(panel, '重置');
+    const closeEl = findFilterOperation(panel, '收起');
+    return {
+      ok: true,
+      groups,
+      reset: resetEl ? elementCenter(resetEl) : null,
+      close: closeEl ? elementCenter(closeEl) : null,
+    };
+  }
+
+  // ── card click / note open / note close ──────────────────────
+  function findCardElement(arg) {
+    const cards = $$('section.note-item, [data-note-id], .feeds-page .note-item');
+    if (!cards.length) return null;
+    const noteId = String((arg && arg.note_id) || '').trim();
+    if (noteId) {
+      for (const card of cards) {
+        if (card.dataset?.noteId === noteId) return card;
+        const link = card.querySelector('a[href*="/explore/"], a[href*="/search_result/"], a[href*="/discovery/"]');
+        if (link?.href?.includes(noteId)) return card;
+      }
+    }
+    const index = arg && Number.isInteger(arg.index) ? arg.index : -1;
+    return index >= 0 && index < cards.length ? cards[index] : null;
+  }
+
+  function clickCard(arg) {
+    // Click cover/img — NOT the <a> tag (XHS blocks direct /explore/<id>
+    // navigation with a 404). React handler intercepts cover clicks to open
+    // the note as an in-page modal.
+    const card = findCardElement(arg);
+    if (!card) return { ok: false, error: 'card_not_found' };
+    card.scrollIntoView({ block: 'center', inline: 'center' });
+    const cover = card.querySelector('.cover, .cover-ld, .note-cover, img');
+    for (const target of cover ? [cover, card] : [card]) {
+      const rect = target.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) continue;
+      return {
+        ok: true,
+        target: target === cover ? 'cover' : 'card',
+        ...elementCenter(target),
+        note_id: card.dataset?.noteId || '',
+      };
+    }
+    return { ok: false, error: 'card_zero_sized' };
+  }
+
+  function closeNote() {
+    const selectors = [
+      '.close-circle', '.note-detail-mask .close', '.note-overlay .close',
+      '.note-modal .close', '.reds-note-detail .close', '.close-button',
+      '.close-btn', '.note-close', 'button.close', '.icon-close',
+      '[aria-label="关闭"]', 'button[aria-label*="close" i]',
+      '.note-detail-mask svg',
+    ];
+    for (const sel of selectors) {
+      const el = $(sel);
+      if (!(el instanceof HTMLElement || el instanceof SVGElement)) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        return { ok: true, selector: sel, ...elementCenter(el) };
+      }
+    }
+    return { ok: false, error: 'close_button_not_found' };
+  }
+
+  function noteOpen() {
+    const url = location.href;
+    // 2026-07 `/search_result_ai` updates history to `/explore/<id>` before
+    // the detail tree mounts. Treating the URL alone as an open note lets the
+    // extractor run against the search feed and pick up the signed-in user or
+    // another card's engagement. The current detail UI exposes these stable
+    // structural roots once it is actually ready for scoped extraction.
+    const detailRoot = getNoteOverlay() || $('#noteContainer');
+    const detailReady = !!detailRoot && isVisible(detailRoot) && (
+      detailRoot.matches?.('#noteContainer, .note-scroller, .note-content')
+      || !!detailRoot.querySelector?.('#noteContainer, .note-scroller, .note-content, .author-container')
+    );
+    return {
+      ok: true,
+      url,
+      on_detail_route: /\/(?:explore|discovery|search_result)\/[^/?#]+/.test(url),
+      has_modal: !!getNoteOverlay(),
+      detail_ready: detailReady,
+      login_required: loginWallVisible(),
+    };
+  }
+
+  // ── note content extraction (root-scoped + visible-only) ─────
+  function detectNoteType(root, stateVideo = null) {
+    if (root?.querySelector?.('video')) return 'video';
+    if (stateVideo?.is_video || stateVideo?.best_url || (stateVideo?.streams || []).length) return 'video';
+    return 'image';
+  }
+
+  function extractNoteIdFromUrl() {
+    const m = location.href.match(/\/(?:explore|discovery|search_result)\/([^/?#]+)/);
+    return m ? m[1] : '';
+  }
+
+  function profileIdFromUrl(url) {
+    const m = String(url || location.href).match(/\/user\/profile\/([^/?#]+)/);
+    return m ? m[1] : '';
+  }
+
+  // URLs that match the fallback selectors but aren't real note carousel
+  // images: author/commenter avatars, sponsor icons, sticker assets, etc.
+  // Note carousel images come from sns-webpic-* / ci.xiaohongshu.com.
+  const NON_NOTE_IMAGE_PATTERNS = [
+    /\/avatar\//i,                            // sns-avatar-qc.xhscdn.com/avatar/...
+    /\/comment\//i,                           // comment-area image attachments
+    /picasso-static\.xiaohongshu\.com/i,      // UI / fe-platform assets
+    /fe-static\.xhscdn\.com/i,                // misc static assets
+  ];
+
+  function cleanImageUrl(url) {
+    const value = absUrl(url || '');
+    if (!value || value.startsWith('data:') || value.startsWith('blob:')) return '';
+    if (NON_NOTE_IMAGE_PATTERNS.some((re) => re.test(value))) return '';
+    return value
+      .replace(/^http:\/\//i, 'https://')
+      .replace(/imageView2\/\d\/w\/\d+\/format\/[^/?#]+/i, '');
+  }
+
+  const NOTE_IMAGE_SELECTORS = [
+    '.note-slider img', '.carousel img', '.carousel-image img',
+    '.swiper-slide img', '.media-container img', '.note-detail img',
+    '#noteContainer img',
+  ];
+
+  function collectImageUrls(root) {
+    const urls = [];
+    const seen = new Set();
+    for (const sel of NOTE_IMAGE_SELECTORS) {
+      for (const img of $$(sel, root)) {
+        if (!isVisible(img)) continue;
+        // Broad fallback selectors (#noteContainer img, .note-detail img)
+        // also match imgs inside the comment area. Skip them — note carousel
+        // imgs live above the comments DOM.
+        if (inCommentArea(img)) continue;
+        const candidates = [
+          img.currentSrc, img.src, img.getAttribute('src'),
+          img.getAttribute('data-src'), img.getAttribute('data-original'),
+        ];
+        for (const candidate of candidates) {
+          const url = cleanImageUrl(candidate);
+          if (!url || seen.has(url)) continue;
+          seen.add(url);
+          urls.push(url);
+        }
+      }
+    }
+    return urls;
+  }
+
+  function mergeUrls(...groups) {
+    const out = [];
+    const seen = new Set();
+    for (const group of groups) {
+      for (const raw of group || []) {
+        const url = cleanImageUrl(raw);
+        if (!url || seen.has(url)) continue;
+        seen.add(url);
+        out.push(url);
+      }
+    }
+    return out;
+  }
+
+  function cleanLocationText(value) {
+    const cleaned = norm(value);
+    if (!cleaned) return '';
+    const lines = cleaned.split(/\n+/).map(norm).filter(Boolean);
+    if (!lines.length) return '';
+    // iPhone Live Photo badges render as visible overlay text in the media
+    // area; they are not note locations/POIs.
+    if (lines.every((line) => /^live$/i.test(line))) return '';
+    if (/^live(?:\s+live)+$/i.test(lines.join(' '))) return '';
+    // Real note locations are compact labels like "北京"; multi-line blobs
+    // here are almost always media overlay or layout noise.
+    if (lines.length > 1 || cleaned.length > 40) return '';
+    return cleaned;
+  }
+
+  // Normalize a Xiaohongshu `.date` label into a stable form. XHS renders the
+  // publish date several ways: absolute ("2024-03-28", "03-28", often prefixed
+  // "编辑于" and/or suffixed with a location like "北京"), or relative for recent
+  // posts ("刚刚", "5分钟前", "11小时前", "今天 13:31", "昨天 13:31", "前天",
+  // "5天前"). The previous extractor only matched the absolute forms, so any
+  // relative date came back empty. Resolve relative dates against now so the
+  // field is comparable downstream; fall back to the cleaned text (edit
+  // prefix / territory tail stripped) rather than emptying the field on
+  // anything unrecognized.
+  function normalizeXhsDate(value) {
+    let t = norm(value);
+    if (!t) return '';
+    // Edited notes show "编辑于 3天前 北京" — the prefix defeats the
+    // start-anchored relative patterns below, so strip it (callers that care
+    // read the edit marker separately via isEditedDate). Then drop a trailing
+    // territory token, mirroring extractIpLocation's tail heuristic — that
+    // function keeps reading the original text, not this cleaned core.
+    t = t.replace(/^编辑于\s*/, '');
+    const tokens = t.split(/\s+/);
+    const tail = tokens.length > 1 ? tokens[tokens.length - 1] : '';
+    if (/^\D{1,10}$/.test(tail) && !/[前刚今昨于:]/.test(tail)) {
+      t = tokens.slice(0, -1).join(' ');
+    }
+    // Absolute token wins (scoped to the short `.date` text, so this can't grab
+    // a "13-15" fragment from the note body). Pass it through unchanged.
+    const abs = t.match(/\d{4}-\d{1,2}-\d{1,2}|\d{1,2}-\d{1,2}/);
+    if (abs) return abs[0];
+    const now = new Date();
+    const fmt = (d) => {
+      const mm = String(d.getMonth() + 1).padStart(2, '0');
+      const dd = String(d.getDate()).padStart(2, '0');
+      // Mirror XHS's own convention: year only when it isn't the current year.
+      return d.getFullYear() === now.getFullYear()
+        ? `${mm}-${dd}`
+        : `${d.getFullYear()}-${mm}-${dd}`;
+    };
+    const daysAgo = (n) => {
+      const d = new Date(now);
+      d.setDate(d.getDate() - n);
+      return d;
+    };
+    if (/刚刚|今天|^\d+\s*(?:秒|分钟|小时)前/.test(t)) return fmt(now);
+    if (/昨天/.test(t)) return fmt(daysAgo(1));
+    if (/前天/.test(t)) return fmt(daysAgo(2));
+    const dm = t.match(/^(\d+)\s*天前/);
+    if (dm) return fmt(daysAgo(parseInt(dm[1], 10)));
+    return t;
+  }
+
+  // "编辑于 …" in the `.date` bar means the note shows its last-edited date,
+  // not the original publish date. Surfaced as `date_edited` so downstream
+  // consumers don't have to infer it from a string prefix.
+  function isEditedDate(value) {
+    return /^编辑于/.test(norm(value));
+  }
+
+  // The author's IP territory ("广东") as shown on the note detail. The note's
+  // __INITIAL_STATE__ field is the original value — return it verbatim. Only
+  // the DOM fallback needs parsing: in the `.date` bar the territory is the
+  // trailing whitespace-separated token ("3天前 广东", "编辑于 03-28 北京"),
+  // so take that token when it isn't part of the date itself.
+  function extractIpLocation(dateText, stateNote) {
+    const fromState = norm(String(unwrapStateValue(stateNote?.ipLocation) || ''));
+    if (fromState) return fromState;
+    const tokens = norm(dateText).split(/\s+/);
+    const tail = tokens.length > 1 ? tokens[tokens.length - 1] : '';
+    return /^\D{1,10}$/.test(tail) && !/[前刚今昨于:]/.test(tail) ? tail : '';
+  }
+
+  function unwrapStateValue(value) {
+    if (value && typeof value === 'object') {
+      if ('_value' in value) return value._value;
+      if ('value' in value && Object.keys(value).length <= 2) return value.value;
+    }
+    return value;
+  }
+
+  function noteFromInitialState(noteId) {
+    try {
+      const state = window.__INITIAL_STATE__ || {};
+      const noteState = unwrapStateValue(state.note) || {};
+      const detailMap = unwrapStateValue(noteState.noteDetailMap) || {};
+      const keys = [];
+      if (noteId) keys.push(noteId);
+      for (const key of Object.keys(detailMap)) {
+        if (!keys.includes(key)) keys.push(key);
+      }
+      for (const key of keys) {
+        const detail = unwrapStateValue(detailMap[key]);
+        const note = unwrapStateValue(detail?.note || detail);
+        if (note && typeof note === 'object') return note;
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  function imageUrlFromStateObject(item) {
+    item = unwrapStateValue(item);
+    if (typeof item === 'string') return cleanImageUrl(item);
+    if (!item || typeof item !== 'object') return '';
+
+    // XHS note detail state usually exposes one object per carousel image.
+    // Prefer a single canonical/high-quality URL per object so we don't
+    // download thumbnail + preview variants of the same image as duplicates.
+    const directKeys = [
+      'urlDefault', 'url_default', 'urlSizeLarge', 'url_size_large',
+      'urlPre', 'url_pre', 'url', 'originalUrl', 'original_url',
+    ];
+    for (const key of directKeys) {
+      const url = cleanImageUrl(item[key]);
+      if (url) return url;
+    }
+
+    const infoList = unwrapStateValue(item.infoList || item.info_list || item.infos || item.imageInfo);
+    if (Array.isArray(infoList)) {
+      const infos = infoList
+        .map(unwrapStateValue)
+        .filter((info) => info && typeof info === 'object');
+      const preferred =
+        infos.find((info) => /dft|default|large|origin/i.test(String(info.imageScene || info.scene || info.type || ''))) ||
+        infos[0];
+      if (preferred) {
+        for (const key of ['url', 'urlDefault', 'url_default', 'urlPre', 'url_pre']) {
+          const url = cleanImageUrl(preferred[key]);
+          if (url) return url;
+        }
+      }
+    }
+
+    return '';
+  }
+
+  function imageUrlsFromInitialState(noteId) {
+    const note = noteFromInitialState(noteId);
+    if (!note || typeof note !== 'object') return [];
+    const out = [];
+    const seen = new Set();
+    const push = (url) => {
+      url = cleanImageUrl(url);
+      if (!url || seen.has(url)) return;
+      seen.add(url);
+      out.push(url);
+    };
+    const collectList = (value) => {
+      value = unwrapStateValue(value);
+      if (!value) return;
+      if (Array.isArray(value)) {
+        for (const item of value) push(imageUrlFromStateObject(item));
+      } else {
+        push(imageUrlFromStateObject(value));
+      }
+    };
+
+    for (const key of ['imageList', 'image_list', 'imagesList', 'images', 'image']) {
+      collectList(note[key]);
+    }
+    return out;
+  }
+
+  function collectStateStreamVariants(stream) {
+    const variants = [];
+    const seen = new Set();
+    const pushVariant = (item, codec) => {
+      item = unwrapStateValue(item);
+      if (!item || typeof item !== 'object') return;
+      const backupUrls = Array.isArray(item.backupUrls) ? item.backupUrls
+        : (Array.isArray(item.backup_urls) ? item.backup_urls : []);
+      const url = item.masterUrl || item.master_url || item.url || item.urlDefault || backupUrls[0] || '';
+      const value = absUrl(url || '');
+      if (!value || seen.has(value)) return;
+      seen.add(value);
+      variants.push({
+        url: value,
+        backup_urls: backupUrls.map(absUrl).filter(Boolean),
+        width: Number(item.width) || null,
+        height: Number(item.height) || null,
+        size: Number(item.size) || null,
+        codec: item.videoCodec || item.video_codec || codec || '',
+        format: item.format || item.videoFormat || '',
+      });
+    };
+    const pushBucket = (bucket, codec) => {
+      bucket = unwrapStateValue(bucket);
+      if (Array.isArray(bucket)) {
+        for (const item of bucket) pushVariant(item, codec);
+      } else if (bucket && typeof bucket === 'object') {
+        pushVariant(bucket, codec);
+      }
+    };
+    if (stream && typeof stream === 'object') {
+      pushBucket(stream.h265, 'h265');
+      pushBucket(stream.h264, 'h264');
+      pushBucket(stream.av1, 'av1');
+      for (const [codec, bucket] of Object.entries(stream)) {
+        if (!['h265', 'h264', 'av1'].includes(codec)) pushBucket(bucket, codec);
+      }
+    }
+    return variants;
+  }
+
+  function videoInfoFromInitialState(noteId) {
+    const note = noteFromInitialState(noteId);
+    const media = note?.video?.media || note?.video || null;
+    const stream = media?.stream || media?.streams || null;
+    const variants = collectStateStreamVariants(stream);
+    let directUrl = '';
+    if (media && typeof media === 'object') {
+      directUrl = media.masterUrl || media.master_url || media.url || media.playUrl || '';
+      if (directUrl && !variants.some((item) => item.url === absUrl(directUrl))) {
+        variants.push({
+          url: absUrl(directUrl),
+          backup_urls: [],
+          width: Number(media.width) || null,
+          height: Number(media.height) || null,
+          size: Number(media.size) || null,
+          codec: media.videoCodec || media.video_codec || '',
+          format: media.format || '',
+        });
+      }
+    }
+    const h2651080 = variants.find((item) => /h265/i.test(item.codec) && Number(item.width) === 1080);
+    const score = (item) => {
+      const codecScore = /h265/i.test(item.codec) ? 3 : (/h264/i.test(item.codec) ? 2 : 1);
+      return codecScore * 1e12 + (Number(item.width) || 0) * 1e8 + (Number(item.size) || 0);
+    };
+    const best = h2651080 || variants.slice().sort((a, b) => score(b) - score(a))[0] || null;
+    const sourceUrls = [];
+    for (const item of variants) {
+      for (const url of [item.url, ...(item.backup_urls || [])]) {
+        if (url && !sourceUrls.includes(url)) sourceUrls.push(url);
+      }
+    }
+    return {
+      is_video: /video|视频/.test(String(note?.type || note?.noteType || note?.cardType || '').toLowerCase()) || !!(best?.url || directUrl || variants.length),
+      best_url: best?.url || '',
+      width: best?.width || null,
+      height: best?.height || null,
+      size: best?.size || null,
+      codec: best?.codec || '',
+      duration_s: Number(media?.video?.duration ?? media?.duration ?? note?.video?.duration) || null,
+      source_urls: sourceUrls,
+      streams: variants,
+    };
+  }
+
+  function collectVideoInfo(root, stateVideo = null) {
+    const video = root.querySelector?.('video');
+    stateVideo = stateVideo || videoInfoFromInitialState(extractNoteIdFromUrl());
+    const candidates = [];
+    const push = (url, source) => {
+      const value = absUrl(url || '');
+      if (!value || candidates.some((item) => item.url === value)) return;
+      candidates.push({ url: value, source });
+    };
+    push(stateVideo.best_url, 'initial_state');
+    for (const url of stateVideo.source_urls || []) push(url, 'initial_state');
+    if (video) {
+      push(video.currentSrc, 'video.currentSrc');
+      push(video.src, 'video.src');
+      for (const sourceEl of $$('source', video)) push(sourceEl.src || sourceEl.getAttribute('src'), 'source');
+    }
+    try {
+      for (const entry of performance.getEntriesByType('resource')) {
+        const name = String(entry.name || '');
+        if (/(\.mp4|\.m3u8|\.m4v|\.mov)(\?|$)|video|vod|hls|sns-video/i.test(name)) {
+          push(name, 'performance');
+        }
+      }
+    } catch (e) {}
+    const poster = video?.poster || root.querySelector?.('img')?.src || '';
+    const resolvedUrl = candidates.find((item) => /^https?:/.test(item.url) && !item.url.startsWith('blob:'))?.url || candidates[0]?.url || '';
+    return {
+      url: candidates[0]?.url || '',
+      resolved_url: resolvedUrl,
+      master_url: stateVideo.best_url || '',
+      poster_url: cleanImageUrl(poster),
+      duration_s: Number.isFinite(video?.duration) ? video.duration : stateVideo.duration_s,
+      width: stateVideo.width,
+      height: stateVideo.height,
+      size: stateVideo.size,
+      codec: stateVideo.codec,
+      source_urls: candidates.map((item) => item.url),
+      candidates,
+      state_streams: stateVideo.streams || [],
+    };
+  }
+
+  // Stop / ignore line filters for the root-text fallback. Trimmed from
+  // flowlens to the cases that actually fire during normal note reads.
+  const STOP_LINE = /^(?:共\s*\d*\s*条评论|展开|收起|说点什么|猜你想搜)$|^(?:刚刚|\d+\s*(?:秒|分钟|小时|天)前|昨天|前天)$|^\d{1,2}-\d{1,2}(?:\s+\S+)?$|^\d{4}-\d{1,2}-\d{1,2}/;
+  const IGNORE_LINE = /^(?:已关注|关注|作者|赞|收藏|评论|分享)$/;
+
+  function extractContentFromRootText(root, title, author) {
+    const lines = norm(text(root)).split(/\n+/).map(norm).filter(Boolean);
+    if (!lines.length) return '';
+    let start = -1;
+    if (title) start = lines.findIndex((line) => line === title || line.includes(title) || title.includes(line));
+    if (start < 0 && author) {
+      const i = lines.findIndex((line) => line === author);
+      if (i >= 0) start = i;
+    }
+    if (start < 0) return '';
+    const body = [];
+    for (const line of lines.slice(start + 1)) {
+      if (!line || line === title || line === author) continue;
+      if (STOP_LINE.test(line)) break;
+      if (IGNORE_LINE.test(line)) continue;
+      body.push(line);
+    }
+    const cleaned = norm(body.join('\n'));
+    return cleaned.length >= 6 ? cleaned : '';
+  }
+
+  function note() {
+    const root = getNoteRoot();
+    const title = firstVisibleText(
+      ['#detail-title', '.note-content .title', '.note-scroller .title', '.note-detail .title', 'h1'],
+      root, { excludeComments: true },
+    );
+    const author = firstVisibleText(
+      ['.author-container .username', '.author-wrapper .username', '.info .username', '.user-name'],
+      root,
+    );
+    const authorLink = root.querySelector?.('a[href*="/user/profile/"], .author-container a, .author-wrapper a');
+    const authorUrl = authorLink ? absUrl(authorLink.href || authorLink.getAttribute('href')) : '';
+    const contentSelectors = [
+      '#detail-desc .note-text', '#detail-desc',
+      '.note-content #detail-desc', '.note-scroller #detail-desc',
+      '.note-content .note-text', '.note-scroller .note-text',
+      '.note-content .desc', '.note-scroller .desc', '.note-detail .desc',
+    ];
+    let content = firstVisibleText(contentSelectors, root, { excludeComments: true });
+    let contentSource = content ? 'selector' : '';
+    if (!content) {
+      content = extractContentFromRootText(root, title, author);
+      if (content) contentSource = 'root_text';
+    }
+    const likes = firstVisibleText(
+      ['.like-wrapper .count', '.engage-bar .like .count', '[data-type="like"] .count'],
+      root, { excludeComments: true },
+    );
+    const favorites = firstVisibleText(
+      ['.collect-wrapper .count', '.engage-bar .collect .count', '[data-type="collect"] .count'],
+      root, { excludeComments: true },
+    );
+    const commentsCount = firstVisibleText(
+      ['.chat-wrapper .count', '.engage-bar .chat .count', '[data-type="chat"] .count'],
+      root, { excludeComments: true },
+    );
+    const shares = firstVisibleText(
+      ['.share-wrapper .count', '.engage-bar .share .count', '[data-type="share"] .count'],
+      root, { excludeComments: true },
+    );
+    const hashtags = $$('.hash-tag a, a[href*="/page/topics/"], #detail-desc a.tag', root)
+      .filter(isVisible).map(text).filter(Boolean);
+    // Publish date lives in the note's bottom bar (`.bottom-container .date`),
+    // e.g. "编辑于 03-28" or "2024-03-28 北京". Scope to that element and pull the
+    // date token out of its short text — regexing the whole note body would
+    // grab things like "13-15" from the content. Comments also use `.date`,
+    // hence excludeComments.
+    const dateText = firstVisibleText(
+      ['.bottom-container .date', '.note-content .date', '.note-scroller .date', '.date'],
+      root,
+      { excludeComments: true },
+    );
+    const date = normalizeXhsDate(dateText);
+    const locationText = cleanLocationText(
+      firstVisibleText(['.location, .poi, [class*="location"], [class*="poi"]'], root, { excludeComments: true })
+    );
+    const noteId = extractNoteIdFromUrl();
+    const ipLocation = extractIpLocation(dateText, noteFromInitialState(noteId));
+    const stateVideo = videoInfoFromInitialState(noteId);
+    const type = detectNoteType(root, stateVideo);
+    const imageUrls = type === 'video' ? [] : mergeUrls(imageUrlsFromInitialState(noteId), collectImageUrls(root));
+    const video = type === 'video' ? collectVideoInfo(root, stateVideo) : null;
+    return {
+      note_id: noteId,
+      url: location.href,
+      type,
+      title,
+      author,
+      author_id: profileIdFromUrl(authorUrl),
+      author_url: authorUrl,
+      content,
+      content_source: contentSource,
+      date,
+      date_edited: isEditedDate(dateText),
+      location: locationText,
+      ip_location: ipLocation,
+      likes: likes === '赞' ? '' : likes,
+      favorites: favorites === '收藏' ? '' : favorites,
+      comments_count: commentsCount === '评论' ? '' : commentsCount,
+      shares: shares === '分享' ? '' : shares,
+      hashtags,
+      image_count: imageUrls.length,
+      image_urls: imageUrls,
+      video,
+    };
+  }
+
+  function carouselImages(opts = {}) {
+    const root = getNoteRoot();
+    const urls = mergeUrls(imageUrlsFromInitialState(extractNoteIdFromUrl()), collectImageUrls(root));
+    const max = Number(opts.max_images) || 12;
+    return {
+      ok: true,
+      image_urls: urls.slice(0, max),
+      image_count: urls.length,
+    };
+  }
+
+  // Official-verification (认证) status of the profile being viewed. The page
+  // state carries only a numeric type (`user.userPageData.verifyInfo
+  // .redOfficialVerifyType`: 1 = personal red-V, 2 = enterprise); the desktop
+  // DOM renders just the matching badge icon (sprite symbol `red` / `company`)
+  // next to the display name, no text label. Prefer state, fall back to the
+  // icon, and derive the human-readable label from the type.
+  function profileVerification() {
+    let type = 0;
+    let label = '';
+    try {
+      const user = unwrapStateValue((window.__INITIAL_STATE__ || {}).user) || {};
+      const pageData = unwrapStateValue(user.userPageData) || {};
+      const info = unwrapStateValue(pageData.verifyInfo) || {};
+      type = Number(unwrapStateValue(info.redOfficialVerifyType)) || 0;
+      label = ['redOfficialVerifyContent', 'verifyContent']
+        .map((key) => norm(String(unwrapStateValue(info[key]) || '')))
+        .find(Boolean) || '';
+    } catch (e) {}
+    if (!type && !label) {
+      // Scoped to the header's name row so verify badges elsewhere on the
+      // page (e.g. recommended-user chips) can't false-positive.
+      const use = $('.user-name .verify-icon use');
+      const ref = use ? String(use.getAttribute('xlink:href') || use.getAttribute('href') || '') : '';
+      if (use) type = /company/i.test(ref) ? 2 : 1;
+    }
+    const verified = type > 0 || !!label;
+    if (verified && !label) {
+      label = type === 2 ? '企业认证' : type === 1 ? '个人认证' : '官方认证';
+    }
+    return { verified, verification: label };
+  }
+
+  function profileInfo() {
+    const displayName = firstVisibleText(
+      ['.user-name', '.profile-name', '.nickname', '.name', 'h1'],
+      document,
+    );
+    const bio = firstVisibleText(['.user-desc', '.profile-desc', '.desc', '.bio'], document);
+    const body = norm(text(document.body));
+    const xhsId = (body.match(/小红书号[:：]?\s*([A-Za-z0-9_.-]+)/) || [])[1] || profileIdFromUrl();
+    const ipLocation = (body.match(/IP属地[:：]?\s*([^\s,，。]+)/i) || [])[1] || '';
+    const statText = (label) => {
+      const re = new RegExp(`([0-9.,万wWkK+]+)\\s*(?:${label})`);
+      return (body.match(re) || [])[1] || '';
+    };
+    const verification = profileVerification();
+    return {
+      ok: true,
+      display_name: displayName,
+      xhs_id: xhsId,
+      profile_url: location.href,
+      bio,
+      ip_location: ipLocation,
+      verified: verification.verified,
+      verification: verification.verification,
+      followers: statText('粉丝'),
+      following: statText('关注'),
+      likes_and_collections: statText('获赞与收藏|获赞|赞与收藏'),
+    };
+  }
+
+  function profileCards() {
+    return searchCards();
+  }
+
+  // ── hydration wait — single round-trip Promise loop ──────────
+  function countLoadingIndicators(root) {
+    return $$(
+      '.loading, [class*="loading"], [class*="Loading"], [class*="skeleton"], [class*="Skeleton"], [class*="shimmer"]',
+      root,
+    ).filter(isVisible).length;
+  }
+
+  function pendingHydration(root) {
+    const preview = norm(text(root)).slice(0, 1200);
+    if (/(^|\n)加载中(?:\n|$)/.test(preview)) return true;
+    if (/正在加载|请稍候|loading/i.test(preview)) return true;
+    return countLoadingIndicators(root) > 0;
+  }
+
+  function noteWithWait(opts = {}) {
+    const timeoutMs = Math.max(500, Number(opts.timeout_ms) || 8000);
+    // Body text and engagement counters now hydrate in separate passes. Keep
+    // every note open for at least one second after body text appears, and
+    // allow up to three seconds when any of the three counters is still an
+    // empty/label placeholder. A caller may request a longer settle.
+    const contentSettleMs = Math.max(1000, Number(opts.settle_ms) || 0);
+    const incompleteEngagementSettleMs = Math.max(contentSettleMs, 3000);
+    return new Promise((resolve) => {
+      const startedAt = Date.now();
+      let contentSeenAt = 0;
+      let best = null;
+      let bestScore = -1;
+      let attempts = 0;
+      const meaningfulStat = (value) => {
+        const valueText = norm(value);
+        return !!valueText && !/^(?:赞|收藏|评论|分享)$/.test(valueText);
+      };
+      const hydrationScore = (value) => {
+        const bodyLength = norm(value.content).length;
+        return (bodyLength ? 1000 + Math.min(bodyLength, 4000) : 0)
+          + (norm(value.title) ? 100 : 0)
+          + (norm(value.author) ? 100 : 0)
+          + [value.likes, value.favorites, value.comments_count]
+            .filter(meaningfulStat).length * 200
+          + (Number(value.image_count) > 0 || value.type === 'video' ? 50 : 0);
+      };
+      const tick = () => {
+        attempts += 1;
+        const value = note();
+        const hasContent = !!norm(value.content);
+        const hasShell = !!(value.note_id || value.title || value.author || value.likes || value.comments_count);
+        const engagementReady = [value.likes, value.favorites, value.comments_count]
+          .every(meaningfulStat);
+        const score = hydrationScore(value);
+        if (hasShell && score >= bestScore) {
+          best = value;
+          bestScore = score;
+        }
+        if (hasContent && !contentSeenAt) contentSeenAt = Date.now();
+        const contentAge = contentSeenAt ? Date.now() - contentSeenAt : 0;
+        const requiredSettleMs = engagementReady
+          ? contentSettleMs
+          : incompleteEngagementSettleMs;
+        if (hasContent && contentAge >= requiredSettleMs) {
+          resolve({ ready: true, reason: engagementReady ? 'content_and_engagement_settled' : 'content_settled', waited_ms: Date.now() - startedAt, attempts, note: best || value });
+          return;
+        }
+        if (Date.now() - startedAt >= timeoutMs) {
+          resolve({ ready: !!best, reason: best ? 'timeout_with_shell' : 'timeout', waited_ms: Date.now() - startedAt, attempts, note: best || value });
+          return;
+        }
+        setTimeout(tick, 250);
+      };
+      tick();
+    });
+  }
+
+  // ── comments ─────────────────────────────────────────────────
+  const COMMENT_ROOT_SELECTOR = '.comment-item, .parent-comment, .comment-inner, .comments-container .comment-item-inner, .comment-wrapper';
+  // All three verified against the live note DOM (image + video notes):
+  //   `.comment-item-sub` — a reply node, inside `.parent-comment > .reply-container`.
+  //   `.show-more`        — the "展开 N 条回复 / 展开更多回复" reply-pagination button.
+  //   `.end-container`    — the " - THE END - " sentinel, present once every parent
+  //                          comment is loaded.
+  const SUB_COMMENT_SELECTOR = '.comment-item-sub';
+  const SHOW_MORE_SELECTOR = '.show-more';
+  const COMMENT_END_SELECTOR = '.end-container';
+
+  function parseCount(raw) {
+    const v = String(raw || '').trim().toLowerCase().replace(/,/g, '').replace(/\+/g, '');
+    const m = v.match(/(\d+(?:\.\d+)?)(万|w|k)?/);
+    if (!m) return 0;
+    let n = parseFloat(m[1]);
+    if (m[2] === '万' || m[2] === 'w') n *= 10000;
+    else if (m[2] === 'k') n *= 1000;
+    return Math.round(n);
+  }
+
+  function firstText(selectors, root) {
+    for (const sel of selectors) {
+      const el = root.querySelector?.(sel);
+      const v = text(el);
+      if (v) return v;
+    }
+    return '';
+  }
+
+  function parseComment(item, includeChildren) {
+    const username = firstText(['.name', '.user-name', '.nickname', '.author-name'], item);
+    const content = firstText(['.content', '.comment-text', '.note-text', '.desc', '[class*="content"]'], item);
+    const likes = firstText(['.like .count', '.like-wrapper .count', '.interact-wrapper .count', '[class*="like"] .count'], item);
+    const time = firstText(['.time', '.date', '.create-time', '.comment-time', '[class*="time"]'], item);
+    const badge = firstText(['.author-tag', '.tag.author', '.reply-tag', '.user-tag', '[class*="author-tag"]'], item);
+    const top = firstText(['.top-tag', '.pinned-tag', '[class*="top-tag"]'], item);
+    const subs = [];
+    if (includeChildren) {
+      const children = $$(SUB_COMMENT_SELECTOR, item).filter((sub) => !sub.parentElement?.closest(SUB_COMMENT_SELECTOR));
+      for (const child of children) {
+        const parsed = parseComment(child, false);
+        if (parsed.text) subs.push(parsed);
+      }
+    }
+    return {
+      username,
+      text: content,
+      likes,
+      like_count: parseCount(likes),
+      // Comment times reuse the note-date normalizer: "10小时前北京" (glued
+      // territory, no space) becomes a resolvable date token.
+      time: normalizeXhsDate(time),
+      is_author_reply: /作者|博主|楼主/.test(badge),
+      is_pinned: /置顶/.test(top),
+      reply_count: subs.length,
+      sub_comments: subs,
+    };
+  }
+
+  function comments(opts = {}) {
+    const root = getNoteRoot();
+    const items = $$(COMMENT_ROOT_SELECTOR, root)
+      .filter((item) => !item.parentElement?.closest(COMMENT_ROOT_SELECTOR));
+    const seen = new Set();
+    let out = [];
+    for (const item of items) {
+      const parsed = parseComment(item, true);
+      if (!parsed.text) continue;
+      const key = `${parsed.username}:${parsed.text.slice(0, 30)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(parsed);
+    }
+    if (opts.prefer_hot !== false) {
+      out.sort((a, b) => (b.like_count + b.reply_count * 3 + (b.is_pinned ? 10 : 0))
+                       - (a.like_count + a.reply_count * 3 + (a.is_pinned ? 10 : 0)));
+    }
+    const max = Number(opts.max_comments) || 0;
+    if (max > 0) out = out.slice(0, max);
+    return out;
+  }
+
+  function commentsSignature(items) {
+    return items
+      .map((item) => `${item.username || ''}:${String(item.text || '').slice(0, 40)}`)
+      .join('|');
+  }
+
+  function commentsWithWait(opts = {}) {
+    const timeoutMs = Math.max(500, Number(opts.timeout_ms) || 5000);
+    const settleMs = Math.max(300, Number(opts.settle_ms) || 900);
+    const emptySettleMs = Math.max(700, Number(opts.empty_settle_ms) || 1800);
+    return new Promise((resolve) => {
+      const startedAt = Date.now();
+      let latest = [];
+      let lastSig = '';
+      let stableSince = startedAt;
+      let emptyShellSeenAt = 0;
+      let attempts = 0;
+      const tick = () => {
+        attempts += 1;
+        const root = getNoteRoot();
+        const items = comments(opts);
+        const sig = commentsSignature(items);
+        if (sig !== lastSig) {
+          lastSig = sig;
+          stableSince = Date.now();
+        }
+        latest = items;
+
+        if (items.length > 0 && Date.now() - stableSince >= settleMs) {
+          resolve({ ready: true, reason: 'comments_ready', waited_ms: Date.now() - startedAt, attempts, comments: items });
+          return;
+        }
+
+        const noCommentCopy = /这是一片荒地|还没有评论哦|暂无评论|还没有评论|抢首评/.test(norm(text(root)).slice(0, 1200));
+        if (!items.length && noCommentCopy && !pendingHydration(root)) {
+          if (!emptyShellSeenAt) emptyShellSeenAt = Date.now();
+          if (Date.now() - emptyShellSeenAt >= emptySettleMs) {
+            resolve({ ready: true, reason: 'no_comments', waited_ms: Date.now() - startedAt, attempts, comments: [] });
+            return;
+          }
+        } else {
+          emptyShellSeenAt = 0;
+        }
+
+        if (Date.now() - startedAt >= timeoutMs) {
+          resolve({ ready: items.length > 0, reason: items.length > 0 ? 'timeout_with_comments' : 'timeout', waited_ms: Date.now() - startedAt, attempts, comments: latest });
+          return;
+        }
+        setTimeout(tick, 250);
+      };
+      tick();
+    });
+  }
+
+  // Snapshot of the comment area used by the Rust-side load loop to decide when
+  // to stop scrolling/expanding: how many primary + reply comments are currently
+  // in the DOM, whether unexpanded reply buttons remain, and whether the
+  // "- THE END -" sentinel (all parent comments loaded) is present.
+  function commentAreaState() {
+    const root = getNoteRoot();
+    const scope = $('.comments-el', root) || root;
+    const items = comments({ prefer_hot: false, max_comments: 0 });
+    const subs = items.reduce((n, c) => n + ((c.sub_comments && c.sub_comments.length) || 0), 0);
+    const totalText = firstText(['.total'], scope);
+    const pending = $$(SHOW_MORE_SELECTOR, scope)
+      .filter((b) => isVisible(b) && !/收起/.test(text(b)));
+    return {
+      ok: true,
+      total: parseCount(totalText),
+      loaded_primary: items.length,
+      loaded_total: items.length + subs,
+      pending_show_more: pending.length,
+      has_end: !!$(COMMENT_END_SELECTOR, scope),
+    };
+  }
+
+  // Click every visible "展开 N 条回复 / 展开更多回复" button to load the next batch
+  // of replies. These are Vue-bound divs, so a synthetic .click() drives the same
+  // handler a human click would. Skips "收起" (collapse). Returns how many fired.
+  function expandCommentReplies(opts = {}) {
+    const root = getNoteRoot();
+    const scope = $('.comments-el', root) || root;
+    const max = Number(opts.max_clicks) || 60;
+    const buttons = $$(SHOW_MORE_SELECTOR, scope)
+      .filter((b) => isVisible(b) && !/收起/.test(text(b)));
+    let clicked = 0;
+    for (const b of buttons) {
+      if (clicked >= max) break;
+      try { b.click(); clicked += 1; } catch (e) { /* ignore */ }
+    }
+    return { ok: true, clicked, remaining: Math.max(0, buttons.length - clicked) };
+  }
+
+  // ── search/feed scroll ───────────────────────────────────────
+  // Lazy-loads more search cards. Default jumps to the bottom (window-size
+  // independent, no hard-coded pixel step) so the site fetches the next page.
+  // With `nudge_up`, instead scrolls back up ~1/10 of a screen: XHS sometimes
+  // ignores a too-fast jump to the bottom and won't load more, but a small
+  // reverse scroll reliably jogs its infinite-scroll observer. The caller waits
+  // for new cards by polling searchCards.
+  //
+  // In the default layout the window itself scrolls. But when the 问点点 AI
+  // summary panel is present (the `.ai-feeds-page.with-ai-chat` layout), the
+  // feed lives in an inner column that scrolls independently and the window
+  // never moves — so a window scroll loads nothing. We therefore locate the
+  // real scroll container by walking up from a note card to its nearest
+  // scrollable ancestor, and only fall back to the window when none is found.
+  function isScrollable(el) {
+    if (!(el instanceof HTMLElement)) return false;
+    const style = window.getComputedStyle(el);
+    const overflowY = style.overflowY || style.overflow || '';
+    return el.scrollHeight > el.clientHeight + 24 && ['auto', 'scroll', 'overlay'].includes(overflowY);
+  }
+
+  function findScrollableFeedContainer() {
+    const cards = $$('section.note-item, [data-note-id], .feeds-page .note-item, .ai-feeds-page .note-item');
+    let node = cards.length
+      ? cards[cards.length - 1]
+      : $('.feeds-container, .feeds-wrapper, .ai-feeds-page');
+    while (node && node !== document.body && node !== document.documentElement) {
+      if (isScrollable(node)) return node;
+      node = node.parentElement;
+    }
+    return null;
+  }
+
+  function scrollFeed(opts = {}) {
+    const container = findScrollableFeedContainer();
+    const target = container || document.scrollingElement || document.documentElement;
+    const useWindow = !container;
+    const before = target.scrollTop;
+    const beforeHeight = target.scrollHeight;
+    const viewport = useWindow ? window.innerHeight : target.clientHeight;
+    if (opts && opts.nudge_up) {
+      const step = Math.max(80, Math.round(viewport / 10));
+      if (useWindow) window.scrollBy({ top: -step, left: 0, behavior: 'instant' });
+      else target.scrollBy({ top: -step, left: 0, behavior: 'instant' });
+    } else if (useWindow) {
+      window.scrollTo({ top: beforeHeight, left: 0, behavior: 'instant' });
+    } else {
+      target.scrollTo({ top: beforeHeight, left: 0, behavior: 'instant' });
+    }
+    const after = target.scrollTop;
+    return {
+      ok: true,
+      container: useWindow ? 'window' : (container.className || container.tagName),
+      before,
+      after,
+      moved: after !== before,
+      scroll_height: beforeHeight,
+      inner_height: viewport,
+    };
+  }
+
+  // ── modal-internal scroll (Promise-resolved) ─────────────────
+  function scrollInNote(opts = {}) {
+    const pixels = Number(opts.pixels) || 400;
+    return new Promise((resolve) => {
+      function scrollable(el) {
+        if (!(el instanceof HTMLElement)) return false;
+        const style = window.getComputedStyle(el);
+        const overflow = style.overflowY || style.overflow || '';
+        return el.scrollHeight > el.clientHeight + 24 && ['auto', 'scroll', 'overlay'].includes(overflow);
+      }
+      const overlay = $('.note-detail-mask, .note-overlay, .note-detail-modal, .note-detail, #noteContainer');
+      // Scope candidates to the overlay when the note is one: a page-level
+      // match (e.g. a generic .scroll-container on the results feed) must
+      // never win the headroom sort while a note is open.
+      const candidates = [
+        ...$$([
+          '.note-scroller', '.note-content', '.note-detail .content', '.scroll-container',
+          '.note-detail', '#noteContainer',
+          '.note-detail-mask [class*="scroll"]', '.note-detail-mask [class*="content"]',
+        ].join(', '), overlay || document),
+        overlay,
+      ].filter(Boolean);
+      const seen = new Set();
+      const unique = [];
+      for (const node of candidates) {
+        if (!(node instanceof HTMLElement) || seen.has(node)) continue;
+        seen.add(node);
+        unique.push(node);
+      }
+      unique.sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight));
+      const container = unique.find(scrollable) || null;
+      if (container) {
+        const before = container.scrollTop;
+        container.scrollBy({ top: pixels, behavior: 'smooth' });
+        setTimeout(() => {
+          const after = container.scrollTop;
+          resolve({
+            ok: after !== before,
+            container: container.className || container.id || container.tagName,
+            delta: after - before,
+            error: after !== before ? '' : 'scroll_did_not_move',
+          });
+        }, 900);
+      } else if ($('section.note-item, .feeds-page .note-item, .ai-feeds-page .note-item')) {
+        // Result-feed cards are mounted below the note (it's a modal): a
+        // window scroll would scroll that feed, and the virtualized grid
+        // then unmounts the cards a scan collected — every later card click
+        // opens the wrong note (stale_note cascade). A short, unscrollable
+        // note simply has nothing more to load; report instead of scrolling.
+        resolve({
+          ok: false,
+          container: 'none',
+          delta: 0,
+          error: 'note_not_scrollable',
+        });
+      } else {
+        const before = window.scrollY;
+        window.scrollBy({ top: pixels, behavior: 'smooth' });
+        setTimeout(() => {
+          const after = window.scrollY;
+          resolve({
+            ok: after !== before,
+            container: 'window',
+            delta: after - before,
+            error: after !== before ? '' : 'scroll_did_not_move',
+          });
+        }, 900);
+      }
+    });
+  }
+
+  return {
+    note,
+    noteWithWait,
+    pageState,
+    loginState,
+    searchCards,
+    searchInput,
+    selectSearchInput,
+    setSearchInput,
+    searchState,
+    searchFilterTrigger,
+    searchFilters,
+    clickCard,
+    closeNote,
+    noteOpen,
+    comments,
+    commentsWithWait,
+    commentAreaState,
+    expandCommentReplies,
+    scrollFeed,
+    scrollInNote,
+    carouselImages,
+    profileInfo,
+    profileCards,
+  };
+})();

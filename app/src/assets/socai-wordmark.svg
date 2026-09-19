@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 32" width="160" height="32" fill="none" role="img" aria-label="socai">
+  <title>socai</title>
+  
+  <rect x="2.5" y="2.5" width="27" height="27" rx="3" stroke="currentColor" stroke-width="1.6"></rect>
+  <rect x="16" y="16" width="10" height="10" rx="1.2" fill="currentColor"></rect>
+  
+  <text x="44" y="22" font-family="General Sans, ui-sans-serif, system-ui, -apple-system, &#39;Helvetica Neue&#39;, Arial, sans-serif" font-size="22" font-weight="500" letter-spacing="-0.55" fill="currentColor">socai</text>
+</svg>

@@ -1,0 +1,222 @@
+{
+  "id": "xhs",
+  "name": "Xiaohongshu",
+  "domains": [
+    "xiaohongshu.com",
+    "*.xiaohongshu.com",
+    "xhslink.com",
+    "*.xhslink.com"
+  ],
+  "notes": ["knowledge.md"],
+  "browserTools": {
+    "note": {
+      "description": "Extract the currently open Xiaohongshu note.",
+      "path": "page_scripts.js",
+      "binding": "SocaiXhsPageScripts",
+      "callable": "note",
+      "args": {},
+      "returns": { "type": "object", "description": "Current note detail." }
+    },
+    "noteWithWait": {
+      "description": "Wait for note hydration and extract the best current detail.",
+      "path": "page_scripts.js",
+      "binding": "SocaiXhsPageScripts",
+      "callable": "noteWithWait",
+      "args": {
+        "timeout_ms": { "type": "integer", "required": false, "description": "Maximum hydration wait in milliseconds." },
+        "settle_ms": { "type": "integer", "required": false, "description": "Minimum content settle time in milliseconds." }
+      },
+      "returns": { "type": "object", "description": "Hydration outcome and note detail." }
+    },
+    "pageState": {
+      "description": "Read the active Xiaohongshu page and modal state.",
+      "path": "page_scripts.js",
+      "binding": "SocaiXhsPageScripts",
+      "callable": "pageState",
+      "args": {},
+      "returns": { "type": "object", "description": "Current page state." }
+    },
+    "loginState": {
+      "description": "Read the active Xiaohongshu login state.",
+      "path": "page_scripts.js",
+      "binding": "SocaiXhsPageScripts",
+      "callable": "loginState",
+      "args": {},
+      "returns": { "type": "object", "description": "Current login state." }
+    },
+    "searchCards": {
+      "description": "Extract visible Xiaohongshu search cards.",
+      "path": "page_scripts.js",
+      "binding": "SocaiXhsPageScripts",
+      "callable": "searchCards",
+      "args": {},
+      "returns": { "type": "array", "description": "Visible search cards." }
+    },
+    "searchInput": {
+      "description": "Locate and inspect the Xiaohongshu search input.",
+      "path": "page_scripts.js",
+      "binding": "SocaiXhsPageScripts",
+      "callable": "searchInput",
+      "args": {},
+      "returns": { "type": "object", "description": "Search input state and geometry." }
+    },
+    "selectSearchInput": {
+      "description": "Select the current Xiaohongshu search input.",
+      "path": "page_scripts.js",
+      "binding": "SocaiXhsPageScripts",
+      "callable": "selectSearchInput",
+      "args": {},
+      "returns": { "type": "object", "description": "Search input selection outcome." }
+    },
+    "setSearchInput": {
+      "description": "Set the current Xiaohongshu search input value.",
+      "path": "page_scripts.js",
+      "binding": "SocaiXhsPageScripts",
+      "callable": "setSearchInput",
+      "args": {
+        "query": { "type": "string", "required": true, "description": "Search text." }
+      },
+      "returns": { "type": "object", "description": "Input update outcome." }
+    },
+    "searchState": {
+      "description": "Read the current Xiaohongshu search transition and result state.",
+      "path": "page_scripts.js",
+      "binding": "SocaiXhsPageScripts",
+      "callable": "searchState",
+      "args": {},
+      "returns": { "type": "object", "description": "Search route and result state." }
+    },
+    "searchFilterTrigger": {
+      "description": "Locate the Xiaohongshu search-filter trigger.",
+      "path": "page_scripts.js",
+      "binding": "SocaiXhsPageScripts",
+      "callable": "searchFilterTrigger",
+      "args": {},
+      "returns": { "type": "object", "description": "Filter trigger state and geometry." }
+    },
+    "searchFilters": {
+      "description": "Read visible Xiaohongshu search-filter groups and options.",
+      "path": "page_scripts.js",
+      "binding": "SocaiXhsPageScripts",
+      "callable": "searchFilters",
+      "args": {},
+      "returns": { "type": "object", "description": "Current filter panel state." }
+    },
+    "clickCard": {
+      "description": "Locate one Xiaohongshu card for a native CDP click.",
+      "path": "page_scripts.js",
+      "binding": "SocaiXhsPageScripts",
+      "callable": "clickCard",
+      "args": {
+        "note_id": { "type": "string", "required": false, "description": "Preferred note id." },
+        "index": { "type": "integer", "required": false, "description": "Fallback visible-card index." }
+      },
+      "returns": { "type": "object", "description": "Card click target geometry." }
+    },
+    "closeNote": {
+      "description": "Locate the close control for the current note.",
+      "path": "page_scripts.js",
+      "binding": "SocaiXhsPageScripts",
+      "callable": "closeNote",
+      "args": {},
+      "returns": { "type": "object", "description": "Close-control state and geometry." }
+    },
+    "noteOpen": {
+      "description": "Check whether a Xiaohongshu note detail is currently open.",
+      "path": "page_scripts.js",
+      "binding": "SocaiXhsPageScripts",
+      "callable": "noteOpen",
+      "args": {},
+      "returns": { "type": "object", "description": "Current note-open state." }
+    },
+    "comments": {
+      "description": "Extract visible Xiaohongshu comments.",
+      "path": "page_scripts.js",
+      "binding": "SocaiXhsPageScripts",
+      "callable": "comments",
+      "args": {
+        "prefer_hot": { "type": "boolean", "required": false, "description": "Sort visible comments by engagement." },
+        "max_comments": { "type": "integer", "required": false, "description": "Maximum comments to return." }
+      },
+      "returns": { "type": "array", "description": "Visible comments." }
+    },
+    "commentsWithWait": {
+      "description": "Wait for the comment region to hydrate and extract comments.",
+      "path": "page_scripts.js",
+      "binding": "SocaiXhsPageScripts",
+      "callable": "commentsWithWait",
+      "args": {
+        "prefer_hot": { "type": "boolean", "required": false, "description": "Sort visible comments by engagement." },
+        "max_comments": { "type": "integer", "required": false, "description": "Maximum comments to return." },
+        "timeout_ms": { "type": "integer", "required": false, "description": "Maximum comment wait in milliseconds." },
+        "settle_ms": { "type": "integer", "required": false, "description": "Non-empty comment settle time in milliseconds." },
+        "empty_settle_ms": { "type": "integer", "required": false, "description": "Empty-state settle time in milliseconds." }
+      },
+      "returns": { "type": "object", "description": "Comment hydration outcome and comments." }
+    },
+    "commentAreaState": {
+      "description": "Read comment-region pagination and hydration state.",
+      "path": "page_scripts.js",
+      "binding": "SocaiXhsPageScripts",
+      "callable": "commentAreaState",
+      "args": {},
+      "returns": { "type": "object", "description": "Current comment-area state." }
+    },
+    "expandCommentReplies": {
+      "description": "Expand visible Xiaohongshu comment replies.",
+      "path": "page_scripts.js",
+      "binding": "SocaiXhsPageScripts",
+      "callable": "expandCommentReplies",
+      "args": {
+        "max_clicks": { "type": "integer", "required": false, "description": "Maximum reply controls to expand." }
+      },
+      "returns": { "type": "object", "description": "Reply expansion outcome." }
+    },
+    "scrollFeed": {
+      "description": "Scroll the Xiaohongshu search feed.",
+      "path": "page_scripts.js",
+      "binding": "SocaiXhsPageScripts",
+      "callable": "scrollFeed",
+      "args": {
+        "nudge_up": { "type": "boolean", "required": false, "description": "Move slightly upward instead of loading downward." }
+      },
+      "returns": { "type": "object", "description": "Feed scroll state." }
+    },
+    "scrollInNote": {
+      "description": "Scroll within the active Xiaohongshu note.",
+      "path": "page_scripts.js",
+      "binding": "SocaiXhsPageScripts",
+      "callable": "scrollInNote",
+      "args": {
+        "pixels": { "type": "integer", "required": false, "description": "Scroll distance in CSS pixels." }
+      },
+      "returns": { "type": "object", "description": "Note scroll outcome." }
+    },
+    "carouselImages": {
+      "description": "Collect image URLs from the active Xiaohongshu carousel.",
+      "path": "page_scripts.js",
+      "binding": "SocaiXhsPageScripts",
+      "callable": "carouselImages",
+      "args": {
+        "max_images": { "type": "integer", "required": false, "description": "Maximum image URLs to return." }
+      },
+      "returns": { "type": "object", "description": "Carousel image URLs and count." }
+    },
+    "profileInfo": {
+      "description": "Extract the current Xiaohongshu profile header.",
+      "path": "page_scripts.js",
+      "binding": "SocaiXhsPageScripts",
+      "callable": "profileInfo",
+      "args": {},
+      "returns": { "type": "object", "description": "Profile header and statistics." }
+    },
+    "profileCards": {
+      "description": "Extract visible cards from the current Xiaohongshu profile.",
+      "path": "page_scripts.js",
+      "binding": "SocaiXhsPageScripts",
+      "callable": "profileCards",
+      "args": {},
+      "returns": { "type": "array", "description": "Visible profile cards." }
+    }
+  }
+}

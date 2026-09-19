@@ -1,0 +1,35 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.socai/
+.claude/*
+!.claude/skills/
+!.claude/skills/**
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Tauri / frontend
+app/node_modules/
+app/dist/
+app/src-tauri/target/
+app/src-tauri/gen/
+
+# Website
+site/node_modules/
+site/dist/
+site/.astro/
+site/.vercel/
+
+# Local scratch (client research folders, one-off notes)
+local/
+
+# Rust workspace
+target/
+
+# Parity scratch runs (commit fixtures intentionally, not ad-hoc smoke runs)
+parity/phase1_smoke/
+parity/extract_note/
+parity/_screenshots/

@@ -1,0 +1,524 @@
+---
+import "../styles/global.css";
+import SiteHeader from "../components/SiteHeader.astro";
+import SiteFooter from "../components/SiteFooter.astro";
+import { message as messageFor } from "../lib/i18n";
+
+const githubUrl = "/github";
+const downloadPath = "/download";
+const downloadWindowsPath = "/download/windows";
+const currentYear = new Date().getFullYear();
+const siteUrl = "https://socai.io";
+const canonicalUrl = `${siteUrl}/`;
+const socialImageUrl = `${siteUrl}/social-card.png`;
+const defaultLanguage = "zh";
+const defaultHtmlLanguage =
+    defaultLanguage === "zh" ? "zh-CN" : defaultLanguage;
+const messages = {
+    en: {
+        meta: {
+            title: "socai · social media research Agent",
+            description:
+                "A local agent that researches Xiaohongshu, Douyin, TikTok, Instagram, and LinkedIn in your signed-in Chrome — real pages, real comments, evidence you can cite.",
+            socialImageAlt: "socai social media research Agent preview",
+        },
+        nav: {
+            primaryAria: "primary navigation",
+            homeAria: "socai home",
+            linksAria: "site links",
+            github: "github",
+            connect: "connect chrome",
+            contact: "contact",
+            languageAria: "language",
+            releaseLabel: "release version {version}",
+        },
+        hero: {
+            title: "an agent that actually reads social media.",
+            subtitle:
+                "not a scraper. not a reverse-engineered API. socai drives the Chrome you're already signed into — Xiaohongshu, Douyin, TikTok, Instagram, LinkedIn — and comes back with evidence you can cite.",
+            platformsAria: "supported platforms",
+            platformXiaohongshu: "Xiaohongshu",
+            platformTiktok: "TikTok / Douyin",
+            platformInstagram: "Instagram",
+            platformLinkedin: "LinkedIn",
+            actionsAria: "download and source",
+            download: "download for macOS",
+            downloadWindows: "download for Windows",
+            github: "view on github",
+        },
+        preview: {
+            sectionAria: "socai app preview",
+            windowAria: "socai desktop app task composer mockup",
+            chromeStatus: "chrome · connected",
+            agentStatus: "Agent · claude · sonnet 4.5",
+            heading: "what should socai research?",
+            description:
+                "start a one-shot browser task. socai opens a temporary chrome tab, runs the Agent, saves the result, then closes the tab.",
+            modeAria: "selected mode: Agent tasks",
+            modeAgent: "Agent tasks",
+            modeTool: "tool tests",
+            agentContext: "Agent · claude ·",
+            newTask: "new task",
+            recent: "recent",
+            history: "view history",
+            recentCoffee: "LinkedIn AI product leaders · 12 profiles",
+            recentCamping: "Instagram vintage shop reels · 8 posts",
+            recentWalk: "TikTok + Douyin city walks · 24 videos",
+            completedNow: "completed · 14:02",
+            completedEarlier: "completed · 11:38",
+            completedYesterday: "completed · yesterday",
+        },
+        footer: {
+            linksAria: "footer links",
+            blog: "blog",
+            connect: "connect guide",
+            contact: "contact",
+        },
+        prompts: [
+            "compare how people discuss sugar-free tea on RedNote, Douyin, and TikTok. cite posts, comments, and replies.",
+            "find high-quality Instagram reels about tokyo vintage shops and summarize why people recommend each shop.",
+            "find LinkedIn people working on AI products at consumer companies and summarize their experience.",
+            "research beginner camping gear across social platforms and organize the mistakes new buyers make most often.",
+        ],
+    },
+    zh: {
+        meta: {
+            title: "socai · 社交媒体调研 Agent",
+            description:
+                "socai 是住在你已登录 Chrome 里的本地社交媒体 Agent。小红书、抖音、TikTok、Instagram、LinkedIn，打开真页面，交回带出处的证据。",
+            socialImageAlt: "socai 社交媒体调研 Agent 界面预览",
+        },
+        nav: {
+            primaryAria: "主导航",
+            homeAria: "socai 首页",
+            linksAria: "站点链接",
+            github: "github",
+            connect: "连接 Chrome",
+            contact: "联系",
+            languageAria: "语言",
+            releaseLabel: "发布版本 {version}",
+        },
+        hero: {
+            title: "真的会读社交媒体的 Agent。",
+            subtitle:
+                "不是爬虫，也不是逆向接口。socai 住在你已登录的 Chrome 里，打开小红书、抖音、TikTok、Instagram、LinkedIn 的真页面，交回带出处的证据。",
+            platformsAria: "支持的平台",
+            platformXiaohongshu: "小红书",
+            platformTiktok: "抖音 / TikTok",
+            platformInstagram: "Instagram",
+            platformLinkedin: "LinkedIn",
+            actionsAria: "下载和源码",
+            download: "下载 macOS 版",
+            downloadWindows: "下载 Windows 版",
+            github: "在 github 查看",
+        },
+        preview: {
+            sectionAria: "socai app 预览",
+            windowAria: "socai 桌面 app 任务输入界面模型",
+            chromeStatus: "chrome · 已连接",
+            agentStatus: "Agent · claude · sonnet 4.5",
+            heading: "想让 socai 调研什么？",
+            description:
+                "输入一次性浏览器任务。socai 会打开临时 chrome 标签页，运行 Agent，保存结果，然后关闭标签页。",
+            modeAria: "已选择模式：Agent 任务",
+            modeAgent: "Agent 任务",
+            modeTool: "工具测试",
+            agentContext: "Agent · claude ·",
+            newTask: "新任务",
+            recent: "最近",
+            history: "查看历史",
+            recentCoffee: "LinkedIn AI 产品负责人 · 12 份档案",
+            recentCamping: "Instagram 东京中古店 Reels · 8 篇",
+            recentWalk: "TikTok + 抖音 city walk · 24 个视频",
+            completedNow: "已完成 · 14:02",
+            completedEarlier: "已完成 · 11:38",
+            completedYesterday: "已完成 · 昨天",
+        },
+        footer: {
+            linksAria: "页脚链接",
+            blog: "博客",
+            connect: "连接教程",
+            contact: "联系",
+        },
+        prompts: [
+            "对比小红书、抖音和 TikTok 上关于无糖茶的讨论，引用具体帖子、评论和回复。",
+            "调研 Instagram 上关于东京中古店的高质量 Reels，总结每家店被推荐的原因。",
+            "在 LinkedIn 搜索消费行业的 AI 产品负责人，并整理他们的相关经历。",
+            "跨平台调研露营入门装备，总结新手最常买错的东西。",
+        ],
+    },
+};
+
+const message = (path: string, language = defaultLanguage) =>
+    messageFor(messages, path, language);
+
+const initialPrompts = messages[defaultLanguage].prompts;
+const pageTitle = message("meta.title");
+const pageDescription = message("meta.description");
+const socialImageAlt = message("meta.socialImageAlt");
+---
+
+<html lang={defaultHtmlLanguage} data-language={defaultLanguage}>
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>{pageTitle}</title>
+        <meta
+            name="description"
+            content={pageDescription}
+            data-i18n-content="meta.description"
+        />
+        <meta name="robots" content="index, follow" />
+        <link rel="canonical" href={canonicalUrl} />
+
+        <meta property="og:type" content="website" />
+        <meta property="og:site_name" content="socai" />
+        <meta property="og:url" content={canonicalUrl} />
+        <meta
+            property="og:title"
+            content={pageTitle}
+            data-i18n-content="meta.title"
+        />
+        <meta
+            property="og:description"
+            content={pageDescription}
+            data-i18n-content="meta.description"
+        />
+        <meta property="og:image" content={socialImageUrl} />
+        <meta property="og:image:type" content="image/png" />
+        <meta property="og:image:width" content="1200" />
+        <meta property="og:image:height" content="630" />
+        <meta
+            property="og:image:alt"
+            content={socialImageAlt}
+            data-i18n-content="meta.socialImageAlt"
+        />
+
+        <meta name="twitter:card" content="summary_large_image" />
+        <meta
+            name="twitter:title"
+            content={pageTitle}
+            data-i18n-content="meta.title"
+        />
+        <meta
+            name="twitter:description"
+            content={pageDescription}
+            data-i18n-content="meta.description"
+        />
+        <meta name="twitter:image" content={socialImageUrl} />
+        <meta
+            name="twitter:image:alt"
+            content={socialImageAlt}
+            data-i18n-content="meta.socialImageAlt"
+        />
+
+        <meta name="theme-color" content="#fafaf9" />
+        <meta name="application-name" content="socai" />
+        <meta name="apple-mobile-web-app-title" content="socai" />
+        <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+        <link
+            rel="apple-touch-icon"
+            sizes="180x180"
+            href="/apple-touch-icon.png"
+        />
+        <link rel="manifest" href="/site.webmanifest" />
+    </head>
+    <body>
+        <div class="site-shell">
+            <SiteHeader
+                messages={messages}
+                language={defaultLanguage}
+            />
+
+            <main class="page-main">
+                <section class="hero" aria-labelledby="hero-title">
+                    <h1 id="hero-title" data-i18n="hero.title">
+                        {message("hero.title")}
+                    </h1>
+                    <ul
+                        class="hero__platforms"
+                        aria-label={message("hero.platformsAria")}
+                        data-i18n-aria-label="hero.platformsAria"
+                    >
+                        <li>
+                            <img
+                                src="/platforms/xiaohongshu.png"
+                                width="24"
+                                height="24"
+                                alt=""
+                            />
+                            <span data-i18n="hero.platformXiaohongshu"
+                                >{message("hero.platformXiaohongshu")}</span
+                            >
+                        </li>
+                        <li>
+                            <img
+                                src="/platforms/tiktok.png"
+                                width="24"
+                                height="24"
+                                alt=""
+                            />
+                            <span data-i18n="hero.platformTiktok"
+                                >{message("hero.platformTiktok")}</span
+                            >
+                        </li>
+                        <li>
+                            <img
+                                src="/platforms/instagram.png"
+                                width="24"
+                                height="24"
+                                alt=""
+                            />
+                            <span data-i18n="hero.platformInstagram"
+                                >{message("hero.platformInstagram")}</span
+                            >
+                        </li>
+                        <li>
+                            <img
+                                src="/platforms/linkedin.svg"
+                                width="24"
+                                height="24"
+                                alt=""
+                            />
+                            <span data-i18n="hero.platformLinkedin"
+                                >{message("hero.platformLinkedin")}</span
+                            >
+                        </li>
+                    </ul>
+                    <p class="hero__subtitle" data-i18n="hero.subtitle">
+                        {message("hero.subtitle")}
+                    </p>
+
+                    <div
+                        class="hero__actions"
+                        aria-label={message("hero.actionsAria")}
+                        data-i18n-aria-label="hero.actionsAria"
+                    >
+                        <a
+                            class="button button--primary"
+                            href={downloadPath}
+                            data-download-platform="macos"
+                        >
+                            <span data-i18n="hero.download"
+                                >{message("hero.download")}</span
+                            >
+                            <span class="button__glyph" aria-hidden="true"
+                                >↓</span
+                            >
+                        </a>
+                        <a
+                            class="button button--primary"
+                            href={downloadWindowsPath}
+                            data-download-platform="windows"
+                        >
+                            <span data-i18n="hero.downloadWindows"
+                                >{message("hero.downloadWindows")}</span
+                            >
+                            <span class="button__glyph" aria-hidden="true"
+                                >↓</span
+                            >
+                        </a>
+                        <a class="button button--secondary" href={githubUrl}>
+                            <svg
+                                viewBox="0 0 16 16"
+                                width="16"
+                                height="16"
+                                fill="currentColor"
+                                aria-hidden="true"
+                            >
+                                <path
+                                    d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"
+                                ></path>
+                            </svg>
+                            <span data-i18n="hero.github"
+                                >{message("hero.github")}</span
+                            >
+                            <span class="button__external" aria-hidden="true"
+                                >↗</span
+                            >
+                        </a>
+                    </div>
+                </section>
+
+                <section
+                    class="app-shot-section"
+                    aria-label={message("preview.sectionAria")}
+                    data-i18n-aria-label="preview.sectionAria"
+                >
+                    <div
+                        class="app-window"
+                        role="img"
+                        aria-label={message("preview.windowAria")}
+                        data-i18n-aria-label="preview.windowAria"
+                    >
+                        <div class="window-bar">
+                            <span class="traffic-light"></span>
+                            <span class="traffic-light"></span>
+                            <span class="traffic-light"></span>
+                            <span class="window-title">socai</span>
+                        </div>
+
+                        <div class="app-topbar">
+                            <div class="app-brand">
+                                <svg
+                                    viewBox="0 0 32 32"
+                                    width="20"
+                                    height="20"
+                                    fill="none"
+                                    aria-hidden="true"
+                                >
+                                    <rect
+                                        x="2.5"
+                                        y="2.5"
+                                        width="27"
+                                        height="27"
+                                        rx="3"
+                                        stroke="currentColor"
+                                        stroke-width="1.6"></rect>
+                                    <rect
+                                        x="16"
+                                        y="16"
+                                        width="10"
+                                        height="10"
+                                        rx="1.2"
+                                        fill="currentColor"></rect>
+                                </svg>
+                                <span>socai</span>
+                            </div>
+
+                            <div class="status-group">
+                                <span class="status-pill status-pill--active"
+                                    ><i></i>
+                                    <span data-i18n="preview.chromeStatus"
+                                        >{message("preview.chromeStatus")}</span
+                                    ></span
+                                >
+                                <span
+                                    class="status-pill"
+                                    data-i18n="preview.agentStatus"
+                                    >{message("preview.agentStatus")}</span
+                                >
+                            </div>
+                        </div>
+
+                        <div class="composer">
+                            <h2 data-i18n="preview.heading">
+                                {message("preview.heading")}
+                            </h2>
+                            <p data-i18n="preview.description">
+                                {message("preview.description")}
+                            </p>
+
+                            <div class="task-card">
+                                <div class="task-input">
+                                    <span
+                                        class="typewriter-text"
+                                        data-typewriter
+                                        data-phrases={JSON.stringify(
+                                            initialPrompts,
+                                        )}>{initialPrompts[0]}</span
+                                    ><span class="cursor" aria-hidden="true"
+                                    ></span>
+                                </div>
+                                <div class="task-controls">
+                                    <span
+                                        class="mode-switch"
+                                        aria-label={message("preview.modeAria")}
+                                        data-i18n-aria-label="preview.modeAria"
+                                    >
+                                        <span
+                                            class="mode-switch__item mode-switch__item--active"
+                                            data-i18n="preview.modeAgent"
+                                            >{
+                                                message("preview.modeAgent")
+                                            }</span
+                                        >
+                                        <span
+                                            class="mode-switch__item"
+                                            data-i18n="preview.modeTool"
+                                            >{message("preview.modeTool")}</span
+                                        >
+                                    </span>
+                                    <span class="agent-context"
+                                        ><span data-i18n="preview.agentContext"
+                                            >{
+                                                message("preview.agentContext")
+                                            }</span
+                                        >
+                                        <strong>claude-sonnet-4-5</strong></span
+                                    >
+                                    <span
+                                        class="new-task-button"
+                                        data-i18n="preview.newTask"
+                                        >{message("preview.newTask")}</span
+                                    >
+                                </div>
+                            </div>
+
+                            <div class="recent-head">
+                                <span data-i18n="preview.recent"
+                                    >{message("preview.recent")}</span
+                                >
+                                <span data-i18n="preview.history"
+                                    >{message("preview.history")}</span
+                                >
+                            </div>
+                            <div class="recent-list">
+                                <div class="recent-row">
+                                    <span>✓</span>
+                                    <span data-i18n="preview.recentCoffee"
+                                        >{message("preview.recentCoffee")}</span
+                                    >
+                                    <span data-i18n="preview.completedNow"
+                                        >{message("preview.completedNow")}</span
+                                    >
+                                </div>
+                                <div class="recent-row">
+                                    <span>✓</span>
+                                    <span data-i18n="preview.recentCamping"
+                                        >{
+                                            message("preview.recentCamping")
+                                        }</span
+                                    >
+                                    <span data-i18n="preview.completedEarlier"
+                                        >{
+                                            message("preview.completedEarlier")
+                                        }</span
+                                    >
+                                </div>
+                                <div class="recent-row">
+                                    <span>✓</span>
+                                    <span data-i18n="preview.recentWalk"
+                                        >{message("preview.recentWalk")}</span
+                                    >
+                                    <span data-i18n="preview.completedYesterday"
+                                        >{
+                                            message(
+                                                "preview.completedYesterday",
+                                            )
+                                        }</span
+                                    >
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+            </main>
+
+            <SiteFooter
+                messages={messages}
+                language={defaultLanguage}
+                currentYear={currentYear}
+            />
+        </div>
+
+        <script
+            id="site-i18n"
+            type="application/json"
+            set:html={JSON.stringify(messages)}
+        />
+        <script>
+            import "../scripts/site.ts";
+        </script>
+    </body>
+</html>

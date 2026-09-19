@@ -1,0 +1,513 @@
+# socai telemetry schema
+
+This document is the current schema, privacy, and configuration contract for
+socai telemetry across both surfaces that emit events:
+
+- the **CLI daemon** (`source: "cli_daemon"`) — one sanitized trace per
+  top-level CLI tool command (introduced in PR #63), and
+- the **desktop app** (`source: "desktop"`) — agent-task lifecycle and per-tool
+  events for tasks the user runs in the Tauri app.
+
+Both surfaces share the same `Telemetry` client in `core/src/telemetry/mod.rs`,
+the same first-party proxy at `https://socai.io/v1/events`, and the same Axiom
+dataset; the `source` field distinguishes them. The public clients never talk to
+PostHog or Axiom directly.
+
+Agent runs additionally upload one OTLP **run trace** per turn — conversation
+content included — through `https://socai.io/v1/traces`. That pipeline has its
+own content contract and controls; see
+[Run traces (agent conversations)](#run-traces-agent-conversations) below.
+
+## Transport and ownership
+
+```text
+socai CLI daemon
+  -> first-party socai proxy: https://socai.io/v1/events
+      -> Axiom dataset
+```
+
+- The CLI endpoint is fixed at `https://socai.io/v1/events`.
+- The public CLI must not include an Axiom token, Axiom dataset secret, or user
+  configurable telemetry endpoint.
+- The Axiom token and dataset configuration live only in Vercel environment
+  variables for the proxy.
+- Telemetry send failures are best-effort and must not fail user commands.
+- The daemon also writes a local JSONL debug buffer under
+  `~/.socai/telemetry/events.jsonl`, or `$SOCAI_HOME/telemetry/events.jsonl`
+  when `SOCAI_HOME` is set.
+
+Source references:
+
+- Shared telemetry client (enrichment, identity, endpoint, local JSONL):
+  `core/src/telemetry/mod.rs`
+- CLI command trace shape and safe result metrics: `cli/src/daemon.rs`
+- Desktop agent-task instrumentation: `app/src-tauri/src/telemetry.rs`,
+  `app/src-tauri/src/commands.rs`, `app/src-tauri/src/lib.rs`
+- Proxy validation, value sanitization, and Axiom forwarding: `site/api/telemetry.js`
+
+## User controls
+
+Telemetry is enabled by default, and query text and LLM chat content are
+included by default.
+
+| Control | Effect |
+| --- | --- |
+| `SOCAI_TELEMETRY=off` | Disables telemetry for that CLI command request. |
+| `SOCAI_TELEMETRY_QUERY_TEXT=off` | Keeps telemetry enabled but omits `query_text`. |
+| `SOCAI_TELEMETRY_CHAT_TEXT=off` | Keeps telemetry enabled but omits content from run traces: LLM chat content (`gen_ai.input.messages` / `gen_ai.output.messages` / `gen_ai.system_instructions`) on `chat` spans and note summaries (`socai.notes`) on `execute_tool` spans. |
+
+The off values accepted by the CLI are:
+
+```text
+0, false, off, disabled, no
+```
+
+These controls are evaluated by the short-lived CLI process and included in the
+request to the long-running daemon, so they apply per command even when an
+existing daemon process is reused.
+
+## Trace model
+
+Each successful or failed top-level daemon command emits one trace after the
+command finishes. The command result can fail while telemetry still records the
+attempt with `ok=false` and an error summary.
+
+Supported command/tool mapping:
+
+| CLI daemon command | `command` | `tool_name` |
+| --- | --- | --- |
+| `search` | `search` | `search` |
+| `author` | `author` | `author_scan` |
+
+Every event carries a top-level `event` field naming its type — the CLI tool
+trace is `socai_tool_call`. The proxy validates that it starts with `socai_` and
+forwards it to Axiom as the type discriminator. The emitting surface is carried
+separately in `source`, so the same `event` value (for example `socai_tool_call`)
+spans both the CLI daemon and the desktop app.
+
+## Forwarded Axiom fields
+
+The proxy forwards **every field the client sends** — there is no field
+allowlist; it only sanitizes values. The fields below are what the clients
+currently emit, so use this as the reference for what to expect in Axiom (not as
+a filter the proxy enforces). Any new client field reaches Axiom automatically.
+
+### Identity and correlation
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `event` | string | Event type, for example `socai_tool_call`, `socai_agent_task_start`, or `socai_agent_task_end`. The surface lives in `source`, not the event name. |
+| `install_id` | string UUID | Stable anonymous install identity stored in `telemetry/identity.json`. |
+| `session_id` | string UUID | One daemon/app process lifetime. |
+| `request_id` | string | One CLI request/daemon command invocation. Treat as opaque. |
+| `schema_version` | number | Telemetry schema version. Current value: `1`. |
+| `account_phone` | string | Full login phone for an authenticated cloud account. Desktop only; omitted while logged out except on an attempted SMS/login event. |
+| `balance_points` | number | Latest server-authoritative point balance cached by the desktop after wallet, invite, recharge, or task-settlement responses. |
+| `pro_active_until` | RFC 3339 string | Latest known Pro expiry. |
+| `pro_subscribed` | boolean | Whether `pro_active_until` is later than the event capture time. |
+
+### App, source, and device context
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `app` | string | Always `socai`. |
+| `source` | string | Emitting surface: `cli_daemon` or `desktop`. |
+| `app_version` | string | socai-core (workspace) version, shared by the CLI daemon and desktop. |
+| `platform` | string | Rust target OS, such as `macos` or `linux`. |
+| `os_version` | string | OS version, for example macOS product version or Linux `PRETTY_NAME`. |
+| `os_kernel_version` | string | Kernel version when available. |
+| `memory_total_mb` | number | Total device memory in MiB when available. |
+| `cpu_count` | number | Available CPU parallelism when available. |
+| `terminal_app` | string | Best-effort terminal/app detection, such as Terminal, Ghostty, WezTerm, kitty, VS Code, Codex-related parent process, or `$TERM`. CLI daemon only. |
+| `parent_process` | string | Best-effort parent process command name on Unix. CLI daemon only. |
+
+### Command, query, and explicit parameters
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `command` | string | Top-level daemon command name. |
+| `tool_name` | string | Tool label used for usage analysis. |
+| `site` | string | Current site integration, `xhs`. |
+| `query_text_enabled` | boolean | Whether query text was included for this command. |
+| `query_text` | string | Search query text when enabled. Omitted when redacted. |
+| `query_len` | number | Query length in Unicode scalar values. Kept even when text is redacted. |
+| `metadata` | object | Explicit optional CLI parameters only. Defaults are omitted. |
+
+Current metadata keys:
+
+| Metadata key | Type | Source CLI flag | Omitted when |
+| --- | --- | --- | --- |
+| `metadata.tab` | string | `search --tab <value>` | `--tab` is not passed or is empty. |
+| `metadata.num_notes` | number | `search --num-notes <n>` | `--num-notes` is not passed. |
+| `metadata.debug_snapshot` | boolean | `--debug-snapshot` | `--debug-snapshot` is not passed / false. |
+
+### Duration, status, and safe result metrics
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `duration_ms` | number | Command runtime in milliseconds. |
+| `ok` | boolean | Whether the command returned successfully. |
+| `error` | string | First-line error summary when `ok=false`. |
+| `result_ok` | boolean | Safe `data.ok` result flag when present. |
+| `cards_count` | number | Count of top-level `cards` result entries when present. |
+| `search_cards_count` | number | Count of `search.cards` entries when present. |
+| `selected_cards_count` | number | Count of selected cards when present. |
+| `notes_count` | number | Count of note result entries when present. |
+| `notes_skipped_count` | number | Count of notes marked skipped when present. |
+| `has_run_dir` | boolean | Whether the command returned a run directory. |
+| `failure_reason` | string | Semantic failure reason when a tool returns `ok=false`. |
+| `page_error` | string | Error or reason associated with the unexpected page/control diagnostic, for example `not_profile_page` or `search_input_not_found`. |
+| `page_url` | string | Unexpected page URL without query or fragment, so access failures can be identified without reporting XHS tokens. |
+| `page_ocr_text` | string | Secret-redacted OCR from the center 70% when XHS has an unexpected page state or a required page control is missing, capped at 200 Unicode characters. |
+| `page_ocr_region` | string | OCR crop identifier; currently `center_70_percent`. |
+| `page_ocr_truncated` | boolean | Whether the recognized page text exceeded 200 characters. |
+| `page_ocr_error` | string | Best-effort screenshot/OCR failure detail when no page text could be produced. |
+| `rate_limit_detected` | boolean | Whether page OCR recognized an XHS frequent-access blocker. |
+| `rate_limit_marker` | string | Matched OCR marker (`访问频繁` or `300013`). |
+| `security_verification_detected` | boolean | Whether page OCR recognized XHS's image-selection security verification. |
+| `security_verification_marker` | string | Matched verification marker (`Security Verification` or `image captcha`). |
+| `recovery_tool` | string | Agent tool recommended for the recognized blocker; currently `wait_for_rate_limit`. |
+| `waited_seconds` | integer | Actual randomized cooldown duration returned by a wait tool. |
+| `proxy_version` | number | Added by the proxy. Current value: `1`. |
+
+## Desktop events
+
+The desktop app emits agent-task lifecycle events rather than a single
+per-command trace. Each event carries the shared identity and context fields
+above with `source: "desktop"`; terminal/parent-process fields are omitted
+because a GUI has no meaningful terminal. Setup/config actions (API-key save,
+model pick, Codex login, app open) are not tracked on their own — the provider
+and model in use are captured on `socai_agent_task_start`.
+
+| Event | Emitted when | Event-specific fields |
+| --- | --- | --- |
+| `socai_browser_connect` | Chrome connection requested, completes, fails, or disconnects | `outcome`, `browser_profile`, `browser_source`, hosted-session `remote_timeout_seconds` / `remote_remaining_seconds`, `error` |
+| `socai_browser_task_recovery` | A running browser tool detects CDP loss and recovery completes, fails, or falls back after the one allowed retry | `task_id`, `outcome`, `duration_ms`, `error` |
+| `socai_auth_sms_requested` | User requests an SMS code | `account_phone`, `outcome`, `error` |
+| `socai_auth_login` / `socai_auth_logout` | A login attempt completes or the user logs out | `account_phone`, `account_device_id` on successful login, `outcome`, `error` |
+| `socai_invite_redeemed` | An invite-code redemption completes or fails | `outcome`, `added_points`, `balance_points`, `duration_days`, `pro_active_until`, `error` |
+| `socai_wallet_snapshot` | The app refreshes the wallet | `balance_points`, `starter_points`, `points_per_cny`, `pro_active_until` |
+| `socai_subscription_checkout` | A WeChat Pay or Alipay order is created or fails | `provider`, `plan_id`, `outcome`, `order_id`, `amount_fen`, `points`, `duration_days`, `error` |
+| `socai_subscription_paid` | Polling first observes a paid subscription order | `order_id`, `amount_fen`, `added_points`, `duration_days`, `pro_active_until` |
+| `socai_agent_task_start` | A task begins running | `task_id`, `provider`, `model`, `task_len`, `task_text` |
+| `socai_agent_task_end` | A task reaches a terminal state | `task_id`, `run_id`, `provider`, `model`, `outcome`, `steps`, token/cache usage, estimated cost breakdown, authoritative `points_used` when settlement completes, `partial`, `degraded_reason`, `duration_ms`, `error` |
+| `socai_tool_call` | Each tool call completes | `task_id`, `run_id`, `tool_name`, `turn`, `sequence`, `duration_ms`, `ok`, `error`, query/result summaries, and bounded unexpected-page diagnostics when present |
+| `socai_feishu_export` | A Feishu export completes/fails, including user-visible setup failures before the native export command starts | `task_id`, `run_id`, `destination`, optional `stage`, `outcome`, `duration_ms`, `error`; chat sends also include privacy-safe CLI failure metadata (`cli_exit_code`, `cli_error_type`, `cli_error_subtype`, `cli_error_code`, `cli_log_id`, `cli_update_available`) and `message_id_present` |
+| `socai_server_payment_callback` | The backend accepts, rejects, or fails a merchant callback | `provider`, `stage`, `outcome`, `order_id`, `amount_fen`, `added_points`, `duration_days`, `error` |
+| `socai_server_asr` | A managed ASR task changes stage | `stage`, `outcome`, `task_id`, `client_task_id`, `provider`, audio duration/size, provider latency/cost, `error` |
+| `socai_server_browser_session` | The backend creates, denies, quota-blocks, or releases a hosted browser | `stage`, `outcome`, `browser_session_id`, timeout/spend/budget fields, `error` |
+
+Desktop field semantics:
+
+Feishu chat failures use `stage` to separate `check_connection`,
+`check_send_scopes`, `validate_send_request`, `execute_send`,
+`parse_send_response`, and `verify_send_response`. CLI notices are not treated
+as errors; `error` comes from the structured CLI error envelope when present.
+CLI log IDs are opaque provider diagnostics and no task content, account,
+profile, document/chat ID, URL, or credential is reported.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `task_id` | string | Stable desktop task identifier (`task-<ms>-<seq>`). Primary correlation key. |
+| `run_id` | string | Core agent run id, attached once the run starts. |
+| `provider` | string | LLM provider requested for the task. |
+| `model` | string | Model id requested for the task. |
+| `outcome` | string | Terminal state: `completed`, `failed`, `cancelled`, or `interrupted`. |
+| `partial` | boolean | True when browser recovery failed but the task still completed by summarizing evidence already gathered. |
+| `degraded_reason` | string | Bounded reason for a partial completion. Omitted for normal completed tasks. |
+| `steps` | number | Agent loop steps when known. |
+| `input_tokens` / `output_tokens` | number | Token usage for the run when known. Input includes cached input. |
+| `uncached_input_tokens` | number | Input tokens processed normally rather than read from or written to cache. |
+| `reasoning_output_tokens` | number | Reasoning tokens when the provider reports a separate count. |
+| `cached_input_tokens` | number | Input tokens served from a provider prompt cache. |
+| `cache_creation_input_tokens` | number | Input tokens written to a provider prompt cache. |
+| `estimated_input_cost` / `estimated_output_cost` | number | Best-effort ordinary input and output cost components. |
+| `estimated_cache_read_cost` / `estimated_cache_creation_cost` | number | Best-effort cache cost components. |
+| `estimated_cost` | number | Sum of the estimated cost components; this is not a provider invoice. |
+| `cost_currency` | string | ISO currency code used by `estimated_cost`. |
+| `cost_estimated` | boolean | Always true for catalog-derived costs. |
+| `cost_pricing_source` | string | Model catalog pricing provenance. |
+| `task_len` | number | Agent prompt length in Unicode scalar values. |
+| `task_text` | string | Full agent prompt. Always sent on desktop; see privacy boundaries. |
+| `turn` / `sequence` | number | Position of a tool call within the run. |
+| `destination` | string | Feishu export target: `document`, `chat`, or `setup` for failures before a destination can be used. |
+| `stage` | string | Feishu operation stage, such as `load_accounts`, `connect_account`, `prepare_document`, `export_document`, `load_chats`, or `send_chat`. |
+
+For `socai_feishu_export`, `outcome` is `completed` or `failed`. The event is
+emitted at the native command boundary for document/group operations. A
+user-visible failure before that boundary is also emitted through a dedicated
+Tauri reporting command with a bounded `stage` allowlist. `run_id` links both
+forms back to the agent turn shown in the trace viewer. Neither form includes
+the exported content, document URL/ID, chat ID, or Feishu account/profile.
+
+`socai_tool_call` mirrors the CLI tool trace's argument summary: the tool's
+`query` argument is lifted to `query_text` + `query_len`, a `note_id` argument
+collapses to a `note_id_present` boolean (the raw id is not sent), and any other
+scalar arguments go under `metadata` — with the `tab_label` arg renamed to `tab`
+and empty strings dropped, matching the CLI. Note bodies, comments, and normal
+scraped content are never included. The sole output-text exception is a
+secret-redacted, 200-character OCR excerpt from the center 70% of the viewport
+when XHS lands on an unexpected page or a required page control cannot be
+found; this is accompanied by the page URL with its query and fragment removed.
+
+Unlike the CLI's `query_text`, **the desktop has no opt-out for `task_text`**: it
+is sent whenever desktop telemetry is enabled. `SOCAI_TELEMETRY=off` is the only
+switch and disables the entire desktop pipeline. The proxy caps `task_text` at
+8,000 characters (other strings stay capped at 2,000).
+
+## Value-level handling
+
+There is **no field allowlist** — every key the client sends is forwarded. The
+proxy only sanitizes values:
+
+- Non-scalar values (objects / arrays) other than `metadata` are dropped.
+- Control characters are stripped from strings; strings are trimmed and truncated.
+- `metadata` is coerced to a shallow primitive object (see limits below).
+- `daemon_session_id` → `session_id` and `distinct_id` → `install_id` aliases are
+  applied; a nested `properties` object is flattened up to the top level.
+
+Axiom also has native time columns (`_time`, `_sysTime`) that it manages itself.
+The client removes `created_at_ms` before sending, so it normally won't appear —
+but because the proxy no longer filters fields, **anything a client sends now
+reaches Axiom**, which is why the privacy boundaries below are enforced
+client-side.
+
+## Local JSONL caveat
+
+The local JSONL buffer is a debug/replay aid, not the forwarded Axiom schema. It
+may contain local-only fields such as:
+
+- `created_at_ms`
+- `properties.created_at_ms`
+- `properties.note_id_present`
+
+The CLI/desktop client strips the local millisecond timestamp before sending to
+the proxy; the proxy forwards every remaining field, sanitizing values only.
+
+## Privacy boundaries
+
+These boundaries apply to the **events pipeline** (`/v1/events`); the run-trace
+pipeline intentionally carries conversation content under its own contract —
+see [Run traces (agent conversations)](#run-traces-agent-conversations). Event
+boundaries are enforced **entirely by the clients** — the proxy no longer
+filters fields, so anything a client sends reaches Axiom. On this pipeline the
+clients must never send:
+
+- note body text
+- comments
+- image data, screenshots, or media contents
+- browser cookies or session storage
+- API keys, bearer tokens, Axiom tokens, or other secrets
+- raw tool output bodies
+- raw note ids or note-id presence flags in forwarded Axiom rows
+- desktop agent results or model output: `report.md` / `final_text`, assistant or
+  reasoning text, and raw tool arguments/results
+
+Approved content-bearing **event** telemetry is limited to:
+
+- the CLI search `query_text` — included by default, omit with
+  `SOCAI_TELEMETRY_QUERY_TEXT=off`; and
+- the desktop agent `task_text` (the prompt the user submits) — always sent when
+  desktop telemetry is enabled, with no per-field opt-out. Only
+  `SOCAI_TELEMETRY=off` suppresses it.
+
+The logged-in desktop also sends the account phone and billing-state scalars
+listed above. These are intentional personal/account data used by the protected
+trace viewer for support and account-history filtering; no device token,
+payment credential, or server user id is sent.
+
+Desktop tool **events** are limited to tool name, timing, success, and a
+truncated error string — never tool arguments or output bodies.
+
+## Run traces (agent conversations)
+
+Separately from events, each agent run writes an OTLP/JSON trace to its run dir
+and the desktop uploads it to `https://socai.io/v1/traces` → the
+`socai-traces-prod` Axiom dataset (proxy: `site/api/traces.js`; assembly:
+`core/src/telemetry/trace.rs`). The TUI writes the same `trace.json` locally but
+never uploads. One conversation = one trace: follow-up turns join the first
+turn's trace id.
+
+Unlike events, run traces are **content-bearing by default** — this is the
+pipeline for reading what an agent actually did:
+
+- `chat` spans — `gen_ai.input.messages` (only the messages new since the
+  previous LLM call), `gen_ai.output.messages` (that call's full response,
+  including reasoning/thinking content and tool calls), and
+  `gen_ai.system_instructions` (once per run, again when it changes).
+- `execute_tool` spans — the argument summary (query text under the
+  `SOCAI_TELEMETRY_QUERY_TEXT` gate), count-only result metrics, and
+  `socai.notes`: id/title/caption/stats summaries of notes the tool returned.
+- every `chat` span and the root span carry normalized usage: logical and
+  uncached input tokens, output and optional reasoning tokens, cache reads and
+  writes, plus estimated input/output/cache cost components, total, currency,
+  and pricing source. The root values aggregate the run; `chat` values describe
+  one provider call.
+- root span — `socai.task_text` (capped at 8,000 chars) plus run status and step
+  count. Partial completions also carry `socai.partial=true` and a bounded
+  `socai.degraded_reason`.
+- trace resource — upload-time snapshots of `socai.pro_activated`,
+  `socai.account_phone`, `socai.points_balance`, `socai.pro_active_until`, and
+  `socai.pro_subscribed` when logged in. No device token or server user id is
+  included.
+
+Never uploaded, regardless of settings: image bytes/screenshots, Anthropic
+thinking signatures, encrypted reasoning items, and browser cookies/session
+storage. For secrets, every uploaded text field — chat content, the root
+`socai.task_text`, and `query_text` on both pipelines — passes a client-side
+scrubber for secret-shaped values before upload: `sk-`-prefixed api keys,
+JWT-shaped tokens, `Bearer` header values, and sensitive JSON fields
+(`api_key`, `device_token`, `access_token`, …). Desktop `read_file`/`shell`
+are confined to `~/.socai`, where `auth.json` stores provider api keys and
+the socai pro `device_token`, so tool results can legitimately contain live
+secrets. The scrubber is pattern-based — a safety net for known formats, not
+a guarantee for arbitrary secret material.
+
+The trace is the per-turn transcript, not a byte-exact request replay: context
+compaction rewrites of older history stay local, and a follow-up turn's seed
+messages are rebuilt from the persisted (artifact-enriched) report rather than
+the raw output the earlier turn's span recorded.
+
+Size limits are enforced client-side: 20,000 chars per message part, 200-char
+note captions, 150 KB per attribute, and a final whole-payload gate that strips
+content attributes (oldest spans first, marked `socai.content_dropped`) only
+when the assembled trace would exceed the proxy's 2 MiB body cap. This keeps
+the most recent spans — including the final answer — whenever they fit. The
+traces proxy stays transport-only (shape gate, body-size cap, rate limit — no
+field inspection).
+
+Controls: `SOCAI_TELEMETRY_CHAT_TEXT=off` removes conversation content and
+note summaries. It is **not** a text-free trace: the root span still carries
+`socai.task_text` (only `SOCAI_TELEMETRY=off` suppresses it), and tool spans
+still carry the `socai.query_text` / `socai.metadata` argument summaries.
+Query text has its own gate — `SOCAI_TELEMETRY_QUERY_TEXT=off` — which also
+redacts the `query` argument inside chat tool-call parts (tool *results* can
+still echo the query; removing those requires the chat gate).
+`SOCAI_TELEMETRY=off` disables the desktop telemetry pipeline entirely,
+including trace upload.
+
+## Sanitization and limits
+
+Proxy behavior in `site/api/telemetry.js`:
+
+- Accepts only JSON `POST` requests.
+- Enforces a maximum request body size of 128 KiB.
+- Accepts at most 100 events/traces per request envelope.
+- Requires each event's `event` name to start with `socai_` (the routing gate);
+  `event` is forwarded as the type discriminator.
+- Forwards every other field the client sends — there is no field allowlist.
+- Drops non-scalar values (objects / arrays) other than `metadata`.
+- Removes ASCII control characters from strings, trims whitespace, and truncates
+  strings longer than 2,000 characters with an ellipsis. `task_text` uses a higher
+  cap of 8,000 characters.
+- Accepts `metadata` as a shallow object only.
+- Limits `metadata` to 20 entries.
+- Allows metadata keys up to 80 characters matching `[A-Za-z0-9_.-]+`.
+- Allows only primitive metadata values: string, finite number, boolean, or null.
+- Applies an in-memory rate limit keyed by install id when available, otherwise
+  by client IP.
+
+CLI behavior in `cli/src/daemon.rs`:
+
+- Error summaries are first-line strings capped to 240 characters before proxy
+  sanitization.
+- Safe result metrics are counts/booleans only, not raw XHS content.
+
+## Example: normal `search` trace
+
+A user runs:
+
+```bash
+socai xhs search "运营爆款思路" --num-notes 12 --tab latest
+```
+
+Representative Axiom row after proxy sanitization:
+
+```json
+{
+  "event": "socai_tool_call",
+  "install_id": "11111111-1111-4111-8111-111111111111",
+  "session_id": "22222222-2222-4222-8222-222222222222",
+  "request_id": "12345-1780616790123",
+  "schema_version": 1,
+  "app": "socai",
+  "source": "cli_daemon",
+  "app_version": "0.1.0",
+  "platform": "macos",
+  "os_version": "15.5",
+  "os_kernel_version": "24.5.0",
+  "memory_total_mb": 65536,
+  "cpu_count": 14,
+  "terminal_app": "Ghostty",
+  "parent_process": "zsh",
+  "command": "search",
+  "tool_name": "search",
+  "site": "xhs",
+  "query_text_enabled": true,
+  "query_text": "运营爆款思路",
+  "query_len": 6,
+  "metadata": {
+    "num_notes": 12,
+    "tab": "latest"
+  },
+  "duration_ms": 42130,
+  "ok": true,
+  "result_ok": true,
+  "search_cards_count": 20,
+  "selected_cards_count": 12,
+  "notes_count": 12,
+  "notes_skipped_count": 1,
+  "has_run_dir": true,
+  "proxy_version": 1
+}
+```
+
+Axiom will also show native `_time` and `_sysTime` columns for the row.
+
+## Example: query-redacted `search` trace
+
+A user runs:
+
+```bash
+SOCAI_TELEMETRY_QUERY_TEXT=off socai xhs search "运营爆款思路" --num-notes 12
+```
+
+Representative Axiom row:
+
+```json
+{
+  "event": "socai_tool_call",
+  "install_id": "11111111-1111-4111-8111-111111111111",
+  "session_id": "22222222-2222-4222-8222-222222222222",
+  "request_id": "12345-1780616790456",
+  "schema_version": 1,
+  "app": "socai",
+  "source": "cli_daemon",
+  "app_version": "0.1.0",
+  "platform": "macos",
+  "command": "search",
+  "tool_name": "search",
+  "site": "xhs",
+  "query_text_enabled": false,
+  "query_len": 6,
+  "metadata": {
+    "num_notes": 12
+  },
+  "duration_ms": 42130,
+  "ok": true,
+  "notes_count": 12,
+  "proxy_version": 1
+}
+```
+
+`query_text` is omitted. `query_len` remains available for aggregate product
+analysis without storing the query string.
+
+## Versioning notes
+
+- `schema_version=1` covers the one-trace-per-tool-command schema described in
+  this document.
+- Additive fields flow through automatically (no allowlist); document them here
+  so Axiom consumers know to expect them.
+- Removing or renaming fields should update this document and any dashboard or
+  release-smoke-test queries that depend on the old names.

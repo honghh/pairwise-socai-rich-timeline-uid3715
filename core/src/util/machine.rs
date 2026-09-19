@@ -1,0 +1,347 @@
+//! Host machine info, collected once and shared so every consumer reports the
+//! same values. Both telemetry (uploaded device fields) and OCR diagnostics
+//! (the local `ocr_perf.json`) read from here, so reported and local machine
+//! info never drift apart.
+
+use std::sync::OnceLock;
+
+/// Cached snapshot of the host's identifying parameters.
+#[derive(Debug, Clone)]
+pub struct MachineInfo {
+    /// `std::env::consts::OS`, e.g. "macos", "linux", "windows".
+    pub os: &'static str,
+    /// `std::env::consts::ARCH`, e.g. "aarch64", "x86_64".
+    pub arch: &'static str,
+    /// Concrete CPU/chip model, e.g. "Apple M4". Empty when undetectable.
+    pub cpu_model: String,
+    /// Logical CPU count.
+    pub cpu_count: Option<usize>,
+    /// Total physical RAM in MiB.
+    pub memory_total_mb: Option<u64>,
+    /// OS product version, e.g. macOS "15.7.3".
+    pub os_version: String,
+    /// OS kernel version (`uname -r` on Unix).
+    pub os_kernel_version: String,
+}
+
+/// Process-free platform snapshot for latency-sensitive prompt construction.
+/// Unlike [`machine_info`], this never launches host commands: Linux reads
+/// procfs/os-release, macOS reads SystemVersion.plist and calls `uname(2)`, and
+/// Windows reads its version through `RtlGetVersion`.
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimePlatformInfo {
+    pub os: &'static str,
+    pub arch: &'static str,
+    pub os_version: String,
+    pub os_kernel_version: String,
+}
+
+pub(crate) fn runtime_platform_info() -> &'static RuntimePlatformInfo {
+    static INFO: OnceLock<RuntimePlatformInfo> = OnceLock::new();
+    INFO.get_or_init(|| RuntimePlatformInfo {
+        os: std::env::consts::OS,
+        arch: std::env::consts::ARCH,
+        os_version: runtime_os_version(),
+        os_kernel_version: runtime_kernel_version(),
+    })
+}
+
+/// Process-global machine info, collected on first use.
+pub fn machine_info() -> &'static MachineInfo {
+    static INFO: OnceLock<MachineInfo> = OnceLock::new();
+    INFO.get_or_init(|| MachineInfo {
+        os: std::env::consts::OS,
+        arch: std::env::consts::ARCH,
+        cpu_model: cpu_model(),
+        cpu_count: std::thread::available_parallelism()
+            .ok()
+            .map(|count| count.get()),
+        memory_total_mb: memory_total_mb(),
+        os_version: os_version(),
+        os_kernel_version: os_kernel_version(),
+    })
+}
+
+/// Best-effort concrete CPU/chip model, e.g. "Apple M4" on macOS,
+/// "Intel(R) Core(TM) i7-…" on Linux, the PROCESSOR_IDENTIFIER on Windows.
+/// Empty string when it can't be determined.
+fn cpu_model() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        let s = command_output("sysctl", &["-n", "machdep.cpu.brand_string"]);
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(txt) = std::fs::read_to_string("/proc/cpuinfo") {
+            for line in txt.lines() {
+                if let Some(rest) = line.strip_prefix("model name") {
+                    if let Some(idx) = rest.find(':') {
+                        let s = rest[idx + 1..].trim().to_string();
+                        if !s.is_empty() {
+                            return s;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // The marketing name ("AMD Ryzen 7 7840H …") lives in the registry —
+        // the same thing macOS exposes as machdep.cpu.brand_string. The
+        // PROCESSOR_IDENTIFIER env var only carries the CPUID family/model/
+        // stepping tuple ("AMD64 Family 25 Model 116 …"), so it's the fallback.
+        let out = command_output(
+            "reg",
+            &[
+                "query",
+                r"HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\0",
+                "/v",
+                "ProcessorNameString",
+            ],
+        );
+        if let Some(idx) = out.find("REG_SZ") {
+            let s = out[idx + "REG_SZ".len()..]
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim();
+            if !s.is_empty() {
+                return s.to_string();
+            }
+        }
+        if let Ok(v) = std::env::var("PROCESSOR_IDENTIFIER") {
+            let s = v.trim().to_string();
+            if !s.is_empty() {
+                return s;
+            }
+        }
+    }
+    String::new()
+}
+
+fn os_version() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        return command_output("sw_vers", &["-productVersion"]);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return linux_pretty_name().unwrap_or_default();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return command_output("cmd", &["/C", "ver"]);
+    }
+    #[allow(unreachable_code)]
+    String::new()
+}
+
+fn os_kernel_version() -> String {
+    #[cfg(unix)]
+    {
+        return command_output("uname", &["-r"]);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return command_output("cmd", &["/C", "ver"]);
+    }
+    #[allow(unreachable_code)]
+    String::new()
+}
+
+#[cfg(target_os = "macos")]
+fn runtime_os_version() -> String {
+    let Ok(text) = std::fs::read_to_string("/System/Library/CoreServices/SystemVersion.plist")
+    else {
+        return String::new();
+    };
+    let Some(after_key) = text
+        .split_once("<key>ProductVersion</key>")
+        .map(|(_, rest)| rest)
+    else {
+        return String::new();
+    };
+    let Some(after_open) = after_key.split_once("<string>").map(|(_, rest)| rest) else {
+        return String::new();
+    };
+    after_open
+        .split_once("</string>")
+        .map(|(value, _)| value.trim().to_string())
+        .unwrap_or_default()
+}
+
+#[cfg(target_os = "linux")]
+fn runtime_os_version() -> String {
+    linux_pretty_name().unwrap_or_default()
+}
+
+#[cfg(target_os = "windows")]
+fn runtime_os_version() -> String {
+    #[repr(C)]
+    struct OsVersionInfoW {
+        size: u32,
+        major: u32,
+        minor: u32,
+        build: u32,
+        platform_id: u32,
+        service_pack: [u16; 128],
+    }
+
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn RtlGetVersion(version: *mut OsVersionInfoW) -> i32;
+    }
+
+    let mut version = OsVersionInfoW {
+        size: std::mem::size_of::<OsVersionInfoW>() as u32,
+        major: 0,
+        minor: 0,
+        build: 0,
+        platform_id: 0,
+        service_pack: [0; 128],
+    };
+    if unsafe { RtlGetVersion(&mut version) } == 0 {
+        format!("{}.{}.{}", version.major, version.minor, version.build)
+    } else {
+        String::new()
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn runtime_os_version() -> String {
+    String::new()
+}
+
+#[cfg(target_os = "linux")]
+fn runtime_kernel_version() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default()
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn runtime_kernel_version() -> String {
+    use std::ffi::CStr;
+
+    let mut info = std::mem::MaybeUninit::<libc::utsname>::zeroed();
+    if unsafe { libc::uname(info.as_mut_ptr()) } != 0 {
+        return String::new();
+    }
+    let info = unsafe { info.assume_init() };
+    unsafe { CStr::from_ptr(info.release.as_ptr()) }
+        .to_string_lossy()
+        .trim()
+        .to_string()
+}
+
+#[cfg(not(unix))]
+fn runtime_kernel_version() -> String {
+    String::new()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_pretty_name() -> Option<String> {
+    let text = std::fs::read_to_string("/etc/os-release").ok()?;
+    for line in text.lines() {
+        let Some(value) = line.strip_prefix("PRETTY_NAME=") else {
+            continue;
+        };
+        return Some(value.trim_matches('"').to_string());
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn memory_total_mb() -> Option<u64> {
+    use std::ffi::CString;
+    let name = CString::new("hw.memsize").ok()?;
+    let mut value: u64 = 0;
+    let mut size = std::mem::size_of::<u64>();
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            (&mut value as *mut u64).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 {
+        Some(value / 1024 / 1024)
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn memory_total_mb() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("MemTotal:") else {
+            continue;
+        };
+        let kb = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+        return Some(kb / 1024);
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn memory_total_mb() -> Option<u64> {
+    // GlobalMemoryStatusEx is the canonical total-RAM query. Hand-declared FFI
+    // (like the macOS sysctl path above) so core doesn't grow a windows-sys
+    // dependency for a single call.
+    #[repr(C)]
+    struct MemoryStatusEx {
+        dw_length: u32,
+        dw_memory_load: u32,
+        ull_total_phys: u64,
+        ull_avail_phys: u64,
+        ull_total_page_file: u64,
+        ull_avail_page_file: u64,
+        ull_total_virtual: u64,
+        ull_avail_virtual: u64,
+        ull_avail_extended_virtual: u64,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+    }
+    let mut status = MemoryStatusEx {
+        dw_length: std::mem::size_of::<MemoryStatusEx>() as u32,
+        dw_memory_load: 0,
+        ull_total_phys: 0,
+        ull_avail_phys: 0,
+        ull_total_page_file: 0,
+        ull_avail_page_file: 0,
+        ull_total_virtual: 0,
+        ull_avail_virtual: 0,
+        ull_avail_extended_virtual: 0,
+    };
+    if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 {
+        Some(status.ull_total_phys / 1024 / 1024)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn memory_total_mb() -> Option<u64> {
+    None
+}
+
+/// Run a command and return its trimmed stdout, or empty string on failure.
+/// Shared with telemetry (parent-process / terminal detection).
+pub(crate) fn command_output(program: &str, args: &[&str]) -> String {
+    let Ok(output) = std::process::Command::new(program).args(args).output() else {
+        return String::new();
+    };
+    if !output.status.success() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}

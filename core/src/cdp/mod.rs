@@ -1,0 +1,21 @@
+pub mod connection;
+pub mod endpoint;
+pub(crate) mod launch;
+pub mod lifecycle;
+pub mod pages;
+pub(crate) mod raw_client;
+pub mod session;
+pub mod snapshot;
+
+pub use self::connection::{
+    BrowserEvent, BrowserInterruptionKind, Cdp, CdpState, ChromeConnectOptions, ChromeProfile,
+    StatusPayload, TargetInfo,
+};
+pub use self::endpoint::{
+    discover_existing_chrome_endpoint, managed_chrome_user_data_dir, open_remote_debugging_page,
+    resolve_explicit_endpoint, wait_for_existing_chrome_endpoint, Endpoint,
+};
+pub use self::pages::PageSessionManager;
+pub(crate) use self::session::PageJavascriptSession;
+pub use self::session::PageSession;
+pub use self::snapshot::{with_snapshot_recording, SnapshotRecorder};

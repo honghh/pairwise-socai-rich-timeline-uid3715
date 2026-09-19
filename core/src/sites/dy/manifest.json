@@ -1,0 +1,119 @@
+{
+  "id": "dy",
+  "name": "Douyin",
+  "domains": [
+    "douyin.com",
+    "*.douyin.com",
+    "iesdouyin.com",
+    "*.iesdouyin.com"
+  ],
+  "notes": ["knowledge.md"],
+  "browserTools": {
+    "pageState": {
+      "description": "Read the current Douyin page, login, challenge, and hydration state.",
+      "path": "page_scripts.js",
+      "binding": "window.SocaiDouyinPageScripts",
+      "callable": "pageState",
+      "args": {},
+      "returns": { "type": "object", "description": "Current page state." }
+    },
+    "searchInput": {
+      "description": "Locate and inspect the Douyin search input.",
+      "path": "page_scripts.js",
+      "binding": "window.SocaiDouyinPageScripts",
+      "callable": "searchInput",
+      "args": {},
+      "returns": { "type": "object", "description": "Search input state and geometry." }
+    },
+    "setSearchInput": {
+      "description": "Set and submit the Douyin search input using the active page DOM.",
+      "path": "page_scripts.js",
+      "binding": "window.SocaiDouyinPageScripts",
+      "callable": "setSearchInput",
+      "args": { "query": { "type": "string", "required": true, "description": "Search text." } },
+      "returns": { "type": "object", "description": "Input and submit outcome." }
+    },
+    "searchState": {
+      "description": "Read the active Douyin search route and result state.",
+      "path": "page_scripts.js",
+      "binding": "window.SocaiDouyinPageScripts",
+      "callable": "searchState",
+      "args": { "query": { "type": "string", "required": false, "description": "Expected search text." } },
+      "returns": { "type": "object", "description": "Search transition and result state." }
+    },
+    "videoCards": {
+      "description": "Collect Douyin video cards across the current lazy result or author grid up to limit.",
+      "path": "page_scripts.js",
+      "binding": "window.SocaiDouyinPageScripts",
+      "callable": "videoCards",
+      "args": {
+        "limit": { "type": "integer", "required": false, "description": "Maximum cards to return." },
+        "author_id": { "type": "string", "required": false, "description": "Optional author id filter." },
+        "viewport_only": { "type": "boolean", "required": false, "description": "Only include cards in the viewport." }
+      },
+      "returns": { "type": "array", "description": "Visible Douyin video cards." }
+    },
+    "scrollFeed": {
+      "description": "Scroll the current Douyin feed or grid by a bounded amount.",
+      "path": "page_scripts.js",
+      "binding": "window.SocaiDouyinPageScripts",
+      "callable": "scrollFeed",
+      "args": {
+        "nudge_up": { "type": "boolean", "required": false, "description": "Move slightly upward instead of down." },
+        "to_top": { "type": "boolean", "required": false, "description": "Reset the active feed to the top." }
+      },
+      "returns": { "type": "object", "description": "Scroll position and movement." }
+    },
+    "videoState": {
+      "description": "Read hydration and identity state for the active Douyin video.",
+      "path": "page_scripts.js",
+      "binding": "window.SocaiDouyinPageScripts",
+      "callable": "videoState",
+      "args": {},
+      "returns": { "type": "object", "description": "Active video state." }
+    },
+    "videoDetail": {
+      "description": "Extract the active Douyin video metadata and media candidates.",
+      "path": "page_scripts.js",
+      "binding": "window.SocaiDouyinPageScripts",
+      "callable": "videoDetail",
+      "args": {},
+      "returns": { "type": "object", "description": "Douyin video detail." }
+    },
+    "comments": {
+      "description": "Collect Douyin comments and expanded replies across the lazy comment panel up to limit.",
+      "path": "page_scripts.js",
+      "binding": "window.SocaiDouyinPageScripts",
+      "callable": "comments",
+      "args": { "limit": { "type": "integer", "required": false, "description": "Maximum comments to return." } },
+      "returns": { "type": "array", "description": "Accumulated, deduplicated comments." }
+    },
+    "scrollComments": {
+      "description": "Scroll the active Douyin comment panel.",
+      "path": "page_scripts.js",
+      "binding": "window.SocaiDouyinPageScripts",
+      "callable": "scrollComments",
+      "args": {},
+      "returns": { "type": "object", "description": "Comment scroll state." }
+    },
+    "authorState": {
+      "description": "Read hydration and challenge state for the current Douyin author page.",
+      "path": "page_scripts.js",
+      "binding": "window.SocaiDouyinPageScripts",
+      "callable": "authorState",
+      "args": {},
+      "returns": { "type": "object", "description": "Author page state." }
+    },
+    "authorProfile": {
+      "description": "Extract the current Douyin author profile and visible works.",
+      "path": "page_scripts.js",
+      "binding": "window.SocaiDouyinPageScripts",
+      "callable": "authorProfile",
+      "args": {
+        "limit": { "type": "integer", "required": false, "description": "Maximum author videos to return." },
+        "viewport_only": { "type": "boolean", "required": false, "description": "Only include author videos in the viewport." }
+      },
+      "returns": { "type": "object", "description": "Douyin author profile." }
+    }
+  }
+}
